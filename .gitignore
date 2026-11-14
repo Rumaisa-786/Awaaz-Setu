@@ -1,0 +1,32 @@
+@'
+# secrets
+.env
+.env.*
+!.env.example
+
+# node
+node_modules/
+dist/
+.vite/
+coverage/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
+
+# generated
+eval/out/
+eval/audio/
+*.log
+playwright-report/
+test-results/
+'@ | Set-Content -Encoding ascii .gitignore
