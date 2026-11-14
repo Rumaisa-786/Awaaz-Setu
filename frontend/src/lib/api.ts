@@ -6,7 +6,9 @@ export function websocketUrl(path: string): string {
   return `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${path}`
 }
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } })
+  const session = supabase ? await supabase.auth.getSession() : null
+  const token = session?.data.session?.access_token || localStorage.getItem('awaaz-access-token')
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...init?.headers } })
   if (!response.ok) {
     let message = `Request failed (${response.status})`
     try { message = (await response.json()).detail || message } catch { /* leave generic */ }
@@ -14,3 +16,4 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   }
   return response.json() as Promise<T>
 }
+import { supabase } from './supabase'

@@ -11,7 +11,7 @@ from app.calls.session import CallSession, CallSessionManager
 from app.config import Settings, get_settings
 from app.entities import analyze_utterance, detect_security_risk, extract_entities
 from app.gnani.audio import FRAME_BYTES
-from app.llm.tasks import confirm_entities, suggest_replies
+from app.llm.tasks import confirm_entities, suggest_replies, translate_text
 
 logger = logging.getLogger(__name__)
 
@@ -45,19 +45,38 @@ async def _send_user(room: CallSession, payload: dict[str, object]) -> None:
 async def process_final_transcript(room: CallSession, text: str, language: str, latency: int | None) -> None:
     if not text.strip():
         return
+    room.detected_language = language or room.detected_language or room.callee_language
     room.turns.append({"role": "caller", "text": text})
-    await _send_user(room, {"type": "final_transcript", "text": text, "detected_language_code": language, "latency": latency})
+    payload = {"type": "final_transcript", "text": text, "translated_text": text, "detected_language_code": room.detected_language, "latency": latency, "turn_index": len(room.turns) - 1}
+    if room.save_history:
+        room.persisted_transcript.append({"role": "caller", "text": text, "translated_text": translated})
+    await _send_user(room, payload)
     analysis = analyze_utterance(text)
     if analysis["entities"] or analysis["otp_pin_cvv_request"]:
         await _send_user(room, {"type": "entities", **analysis})
     # Suggestions and entity confirmation run independently; neither blocks the caption frame.
     asyncio.create_task(_enrich_final(room, text, language, analysis))
+    if room.detected_language != room.user_language:
+        asyncio.create_task(_translate_caption(room, text, room.detected_language, len(room.turns) - 1))
+
+
+async def _translate_caption(room: CallSession, text: str, source_language: str, turn_index: int) -> None:
+    try:
+        translated = await translate_text(text, source_language, room.user_language)
+        if turn_index < len(room.turns) and room.turns[turn_index].get("role") == "caller":
+            room.turns[turn_index]["translated_text"] = translated
+        await _send_user(room, {"type": "caption_translation", "turn_index": turn_index, "text": translated})
+        translated_entities = analyze_utterance(translated)
+        if translated_entities["entities"] or translated_entities["otp_pin_cvv_request"]:
+            await _send_user(room, {"type": "entities", **translated_entities})
+    except Exception as exc:
+        logger.info("Caption translation failed (%s)", type(exc).__name__)
 
 
 async def _enrich_final(room: CallSession, text: str, language: str, analysis: dict[str, object]) -> None:
     try:
         suggestions, confirmed = await asyncio.gather(
-            suggest_replies(text, language or "en-IN", room.goal, room.keyterms if room.use_keyterms else [], room.turns),
+            suggest_replies(text, language or room.detected_language or "en-IN", room.goal, room.keyterms if room.use_keyterms else [], room.turns, reply_language=room.user_language),
             confirm_entities(text, extract_entities(text), bool(analysis["otp_pin_cvv_request"])),
         )
         await _send_user(room, {"type": "suggestions", "replies": suggestions.replies, "needs_free_text": suggestions.needs_free_text, "language": language})
@@ -141,6 +160,10 @@ async def _receive_transcripts(room: CallSession, upstream: websockets.ClientCon
             await process_final_transcript(room, str(event.get("text", "")), str(event.get("detected_language_code", "")), _latency(event))
         elif kind in {"speech_start", "speech_end", "processing"}:
             normalized = "speech_end" if kind == "processing" else kind
+            if normalized == "speech_start":
+                room.transform_gate.clear()
+            else:
+                room.transform_gate.set()
             await _send_user(room, {"type": normalized})
         elif kind == "error":
             await _send_user(room, {"type": "connection_error", "service": "stt", "message": "Prisma reported a stream error."})
@@ -172,3 +195,108 @@ async def _run_mock_stt(room: CallSession) -> None:
         await asyncio.sleep(0.15)
         await process_final_transcript(room, sample, language, 180)
         await _send_user(room, {"type": "speech_end"})
+
+
+async def run_user_transform(room: CallSession, manager: CallSessionManager) -> None:
+    """Dedicated user-side STT path. It never shares the callee audio queue."""
+    settings = manager.settings
+    while room.state != "ended":
+        if room.input_mode != "transform":
+            room.user_mode_changed.clear()
+            await room.user_mode_changed.wait()
+            continue
+        room.user_mode_changed.clear()
+        if room.input_mode != "transform":
+            continue
+        if settings.mock_mode:
+            await room.transform_gate.wait()
+            frame_task = asyncio.create_task(room.user_audio_queue.get())
+            changed_task = asyncio.create_task(room.user_mode_changed.wait())
+            done, pending = await asyncio.wait({frame_task, changed_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if changed_task in done or room.input_mode != "transform":
+                continue
+            frame = frame_task.result()
+            sample = "Please call me tomorrow morning."
+            await _send_user(room, {"type": "user_partial", "text": sample})
+            await _transform_user_final(room, sample)
+            continue
+        if not settings.gnani_api_key.get_secret_value():
+            await _send_user(room, {"type": "error", "message": "Prisma is not configured for speech transformation."})
+            await room.user_mode_changed.wait()
+            continue
+        endpoint = settings.gnani_base_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/stt/v3/stream"
+        headers = {"x-api-key-id": settings.gnani_api_key.get_secret_value(), "x-sample-rate": "16000", "language_code": room.user_language, "x-language-code": room.user_language, "x-format": "transcribe", "x-model": "prisma-v3.0", "x-partials": "true"}
+        try:
+            async with websockets.connect(endpoint, additional_headers=headers, open_timeout=8, close_timeout=2) as upstream:
+                async def send_user_audio():
+                    while room.state != "ended" and room.input_mode == "transform":
+                        await room.transform_gate.wait()
+                        if room.input_mode != "transform":
+                            return
+                        frame = await room.user_audio_queue.get()
+                        if len(frame) == FRAME_BYTES:
+                            await upstream.send(frame)
+                            await asyncio.sleep(.032)
+                async def receive_user_text():
+                    async for raw in upstream:
+                        if not isinstance(raw, str):
+                            continue
+                        try:
+                            event = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        kind = event.get("type")
+                        if kind in {"partial", "partial_transcript"}:
+                            await _send_user(room, {"type": "user_partial", "text": event.get("stable_text", "") + event.get("volatile_text", "")})
+                        if kind in {"transcript", "final_transcript"}:
+                            await _transform_user_final(room, str(event.get("text", "")))
+                sender = asyncio.create_task(send_user_audio())
+                receiver = asyncio.create_task(receive_user_text())
+                change = asyncio.create_task(room.user_mode_changed.wait())
+                done, pending = await asyncio.wait({sender, receiver, change}, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if change not in done and room.input_mode == "transform" and room.state != "ended":
+                    raise ConnectionError("User STT stream closed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info("User Prisma stream disconnected (%s)", type(exc).__name__)
+            await asyncio.sleep(settings.prisma_reconnect_seconds)
+
+
+async def _transform_user_final(room: CallSession, text: str) -> None:
+    if not text.strip():
+        return
+    await _send_user(room, {"type": "user_final", "text": text})
+    if room.transform_review:
+        return
+    await _speak_transformed(room, text)
+
+
+async def _speak_transformed(room: CallSession, text: str) -> None:
+    from app.calls.transport import WebLinkTransport
+    from app.gnani.tts import TTSService
+    from app.calls.session import manager
+    from app.calls.tones import Tone
+    from app.llm.tasks import relay_reply
+    language = room.detected_language or room.callee_language
+    result = await relay_reply(text, room.user_language, language, room.tone)
+    room.turns.append({"role": "user", "text": text, "translated_text": result.rewritten_text})
+    await _send_user(room, {"type": "transform_spoken", "text": text, "spoken_text": result.rewritten_text})
+    if not room.callee_socket:
+        return
+    transport = WebLinkTransport(room.callee_socket, on_first_audio=lambda: _send_user(room, {"type": "tts_status", "state": "speaking"}))
+    room.transform_gate.clear()
+    try:
+        await TTSService(manager).speak(room, transport, result.rewritten_text, room.voice, language, room.tone, result.audio_tag)
+    finally:
+        room.transform_gate.set()
+
+
+async def speak_reviewed_transform(room: CallSession, text: str) -> None:
+    await _speak_transformed(room, text)

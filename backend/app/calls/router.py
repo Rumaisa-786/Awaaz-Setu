@@ -5,17 +5,18 @@ import secrets
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field, field_validator
 
-from app.calls.relay import run_prisma_relay
+from app.calls.relay import run_prisma_relay, run_user_transform, speak_reviewed_transform
 from app.calls.session import CallLimitExceeded, CallSession, manager
 from app.calls.tones import ALL_VOICES, Tone
 from app.calls.transport import WebLinkTransport
+from app.auth import resolve_user
 from app.config import get_settings
 from app.gnani.audio import FRAME_BYTES
 from app.gnani.tts import TTSService
-from app.llm.tasks import apply_tone
+from app.llm.tasks import relay_reply, summarize_call
 
 router = APIRouter()
 tts_service = TTSService(manager)
@@ -47,6 +48,7 @@ class CreateCallRequest(BaseModel):
 
 class EndCallRequest(BaseModel):
     user_token: str
+    save_history: bool = False
 
 
 def _public_room(room: CallSession) -> dict[str, Any]:
@@ -54,21 +56,21 @@ def _public_room(room: CallSession) -> dict[str, Any]:
 
 
 @router.post("/api/calls", status_code=201)
-async def create_call(request: CreateCallRequest) -> dict[str, object]:
-    if request.voice not in ALL_VOICES:
+async def create_call(payload: CreateCallRequest, request: Request) -> dict[str, object]:
+    if payload.voice not in ALL_VOICES:
         raise HTTPException(422, "Unsupported Timbre v3.0 voice")
-    if any("<|" in term or "|>" in term for term in request.keyterms):
+    if any("<|" in term or "|>" in term for term in payload.keyterms):
         raise HTTPException(422, "Keyterms contain an invalid marker")
     try:
         room = await manager.create(
-            owner_id="dev-stub-user",
-            goal=request.goal.strip(),
-            user_language=request.user_language,
-            callee_language=request.callee_language,
-            voice=request.voice,
-            tone=request.tone,
-            keyterms=[term.strip()[:80] for term in request.keyterms if term.strip()],
-            use_keyterms=request.use_keyterms,
+            owner_id=await resolve_user(request),
+            goal=payload.goal.strip(),
+            user_language=payload.user_language,
+            callee_language=payload.callee_language,
+            voice=payload.voice,
+            tone=payload.tone,
+            keyterms=[term.strip()[:80] for term in payload.keyterms if term.strip()],
+            use_keyterms=payload.use_keyterms,
         )
     except CallLimitExceeded as exc:
         raise HTTPException(429, str(exc)) from exc
@@ -85,15 +87,19 @@ async def get_call(code: str) -> dict[str, object]:
 
 
 @router.post("/api/calls/{code}/end")
-async def end_call(code: str, request: EndCallRequest) -> dict[str, str]:
+async def end_call(code: str, request: EndCallRequest) -> dict[str, Any]:
     try:
         room = await manager.end(code, request.user_token)
     except PermissionError as exc:
         raise HTTPException(403, "Only the call owner can end this call") from exc
     if not room:
         raise HTTPException(404, "Call not found")
+    room.save_history = request.save_history
+    room.summary = (await summarize_call(room.turns, room.user_language)).model_dump()
+    if room.save_history:
+        room.persisted_transcript = room.turns.copy()
     await _notify_end(room)
-    return {"state": "ended"}
+    return {"state": "ended", "summary": room.summary, "saved": room.save_history}
 
 
 async def _notify_end(room: CallSession) -> None:
@@ -134,15 +140,38 @@ async def user_channel(websocket: WebSocket, code: str) -> None:
             await websocket.close(code=4403)
             return
         room.user_socket = websocket
+        transform_task = asyncio.create_task(run_user_transform(room, manager))
         await websocket.send_json({"type": "connected", "channel": "user", "mock_mode": get_settings().mock_mode, "state": room.state})
         if room.turns:
             await websocket.send_json({"type": "transcript_history", "turns": room.turns[-50:]})
         while room.state != "ended":
-            message = await websocket.receive_json()
+            packet = await websocket.receive()
+            if packet.get("type") == "websocket.disconnect":
+                break
+            if packet.get("bytes") is not None:
+                data = packet["bytes"]
+                if len(data) != FRAME_BYTES:
+                    await _send_room(room, {"type": "error", "message": "Audio frames must contain exactly 1,024 bytes."})
+                elif room.input_mode == "direct":
+                    if room.callee_socket:
+                        await room.callee_socket.send_bytes(data)
+                elif room.input_mode == "transform" and room.transform_gate.is_set():
+                    try:
+                        room.user_audio_queue.put_nowait(data)
+                    except asyncio.QueueFull:
+                        pass
+                continue
+            try:
+                message = __import__("json").loads(packet.get("text") or "{}")
+            except ValueError:
+                continue
             await _handle_user_message(room, message)
     except (WebSocketDisconnect, asyncio.TimeoutError):
         pass
     finally:
+        if 'transform_task' in locals():
+            transform_task.cancel()
+            await asyncio.gather(transform_task, return_exceptions=True)
         if room.user_socket is websocket:
             room.user_socket = None
 
@@ -170,6 +199,34 @@ async def _handle_user_message(room: CallSession, message: dict[str, Any]) -> No
         if voice in ALL_VOICES:
             room.voice = voice
         return
+    if kind == "input_mode":
+        mode = message.get("mode")
+        if mode not in {"type", "direct", "transform"}:
+            await _send_room(room, {"type": "error", "message": "Choose one of the available input modes."})
+            return
+        if room.input_mode != mode:
+            room.input_mode = mode
+            room.direct_audio = mode == "direct"
+            room.user_mode_changed.set()
+        await _send_room(room, {"type": "input_mode", "mode": mode})
+        return
+    if kind == "transform_settings":
+        room.transform_review = message.get("behavior", "review") != "auto"
+        await _send_room(room, {"type": "transform_settings", "behavior": "review" if room.transform_review else "auto"})
+        return
+    if kind == "send_transform":
+        text = str(message.get("text", "")).strip()
+        if text and len(text) <= 1000:
+            await speak_reviewed_transform(room, text)
+        return
+    if kind == "language_override":
+        language = str(message.get("language", ""))
+        if language in {"bn-IN", "en-IN", "gu-IN", "hi-IN", "kn-IN", "ml-IN", "mr-IN", "pa-IN", "ta-IN", "te-IN"}:
+            room.detected_language = language
+            room.callee_language = language
+            room.settings_changed.set()
+            await _send_room(room, {"type": "language", "language": language, "manual": True})
+        return
     if kind == "end_call":
         await manager.end(room.code, room.user_token)
         await _notify_end(room)
@@ -185,12 +242,13 @@ async def _handle_user_message(room: CallSession, message: dict[str, Any]) -> No
         tone = Tone(message.get("tone", room.tone.value))
     except ValueError:
         tone = room.tone
-    rewrite = await apply_tone(text, tone, room.callee_language)
+    source_language = str(message.get("language", room.user_language))
+    rewrite = await relay_reply(text, source_language, room.detected_language or room.callee_language, tone)
     if kind == "preview_tone":
         await _send_room(room, {"type": "tone_preview", "text": rewrite.rewritten_text, "tone": tone.value})
         return
-    room.turns.append({"role": "user", "text": text})
-    await _send_room(room, {"type": "user_reply", "text": text})
+    room.turns.append({"role": "user", "text": text, "translated_text": rewrite.rewritten_text})
+    await _send_room(room, {"type": "user_reply", "text": text, "spoken_text": rewrite.rewritten_text, "language": room.detected_language or room.callee_language})
     callee = room.callee_socket
     if not callee:
         await _send_room(room, {"type": "error", "message": "The other caller has not joined yet."})
@@ -198,7 +256,7 @@ async def _handle_user_message(room: CallSession, message: dict[str, Any]) -> No
     transport = WebLinkTransport(callee, on_first_audio=lambda: _send_room(room, {"type": "tts_status", "state": "speaking"}))
     await _send_room(room, {"type": "tts_status", "state": "synthesizing"})
     try:
-        await tts_service.speak(room, transport, rewrite.rewritten_text, room.voice, room.callee_language, tone, rewrite.audio_tag)
+        await tts_service.speak(room, transport, rewrite.rewritten_text, room.voice, room.detected_language or room.callee_language, tone, rewrite.audio_tag)
         await transport.send_event({"type": "user_status", "state": "delivered"})
         await _send_room(room, {"type": "tts_status", "state": "delivered"})
     except Exception as exc:
@@ -239,6 +297,8 @@ async def callee_channel(websocket: WebSocket, code: str) -> None:
                     await websocket.send_json({"type": "error", "message": "Audio frames must contain exactly 1,024 bytes."})
                     continue
                 try:
+                    # This socket is exclusively callee -> Prisma -> captions.
+                    # User mic frames enter through the separately authenticated user socket.
                     room.audio_queue.put_nowait(data)
                 except asyncio.QueueFull:
                     # Keep microphone capture responsive through a short upstream outage.

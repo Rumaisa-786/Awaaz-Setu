@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     tts_daily_char_limit: int = Field(default=50_000, ge=1)
     tts_session_char_limit: int = Field(default=5_000, ge=1)
     prisma_reconnect_seconds: float = Field(default=1.0, ge=0.1, le=30)
+    supabase_url: str = ""
+    supabase_anon_key: SecretStr = SecretStr("")
+    supabase_jwt_secret: SecretStr = SecretStr("")
+
+    @property
+    def supabase_enabled(self) -> bool:
+        return bool(self.supabase_url.strip() and self.supabase_anon_key.get_secret_value().strip())
 
 
 @lru_cache

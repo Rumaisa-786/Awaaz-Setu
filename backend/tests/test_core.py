@@ -1,4 +1,5 @@
 from pydantic import BaseModel
+from pydantic import SecretStr
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,6 +11,7 @@ from app.entities import analyze_utterance, detect_security_risk, extract_entiti
 from app.gnani.audio import FRAME_BYTES
 from app.limits import CostLimitExceeded, CostLimits, Usage, check_limits
 from app.llm.provider import MockLLMProvider, create_provider
+from app.llm import tasks as llm_tasks
 from app.main import app, health
 
 
@@ -121,3 +123,72 @@ def test_mock_two_channel_websocket_call_flow(monkeypatch):
                 assert any(event["type"] == "tts_status" for event in callee_events)
             ended = client.post(f"/api/calls/{room['code']}/end", json={"user_token": room["user_token"]})
             assert ended.status_code == 200
+
+
+def test_cross_language_reply_is_a_single_combined_provider_call(monkeypatch):
+    class FakeProvider:
+        calls = 0
+        async def generate_json(self, prompt, schema):
+            self.calls += 1
+            assert "Translate" in prompt and "register" in prompt
+            return schema(translated_text="வணக்கம்", rewritten_text="வணக்கம்", audio_tag="<slow>")
+    fake = FakeProvider()
+    monkeypatch.setattr(llm_tasks, "provider", lambda: fake)
+    monkeypatch.setattr(llm_tasks, "get_settings", lambda: Settings(mock_mode=False, _env_file=None))
+    import asyncio
+    result = asyncio.run(llm_tasks.relay_reply("Hello", "en-IN", "ta-IN", Tone.POLITE))
+    assert result.translated_text == "வணக்கம்"
+    assert fake.calls == 1
+
+
+def test_guest_mode_call_creation_without_supabase(monkeypatch):
+    monkeypatch.setattr(global_manager.settings, "supabase_url", "")
+    monkeypatch.setattr(global_manager.settings, "supabase_anon_key", SecretStr(""))
+    response = TestClient(app).post("/api/calls", json={})
+    assert response.status_code == 201
+    room = global_manager.sessions[response.json()["code"]]
+    assert room.owner_id == "guest-local"
+
+
+def test_summary_and_transcript_persist_only_after_explicit_opt_in(monkeypatch):
+    monkeypatch.setattr(global_manager.settings, "mock_mode", True)
+    client = TestClient(app)
+    created = client.post("/api/calls", json={}).json()
+    room = global_manager.sessions[created["code"]]
+    room.turns.append({"role": "caller", "text": "Appointment tomorrow"})
+    response = client.post(f"/api/calls/{room.code}/end", json={"user_token": created["user_token"], "save_history": False})
+    assert response.json()["summary"]["plain_language_summary"]
+    assert response.json()["saved"] is False
+    assert room.persisted_transcript == []
+    created_again = client.post("/api/calls", json={}).json()
+    saved_room = global_manager.sessions[created_again["code"]]
+    saved_room.turns.append({"role": "caller", "text": "Call back at 10"})
+    saved = client.post(f"/api/calls/{saved_room.code}/end", json={"user_token": created_again["user_token"], "save_history": True})
+    assert saved.json()["saved"] is True
+    assert saved_room.persisted_transcript == [{"role": "caller", "text": "Call back at 10"}]
+
+
+def test_speak_direct_and_transform_use_separate_user_audio_channel(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(global_manager.settings, "mock_mode", True)
+    with TestClient(app) as client:
+        created = client.post("/api/calls", json={}).json()
+        room = global_manager.sessions[created["code"]]
+        with client.websocket_connect(f"/ws/call/user/{room.code}") as user, client.websocket_connect(f"/ws/call/callee/{room.code}") as callee:
+            user.send_json({"type": "auth", "token": created["user_token"]})
+            assert user.receive_json()["channel"] == "user"
+            assert callee.receive_json()["channel"] == "callee"
+            user.send_json({"type": "input_mode", "mode": "direct"})
+            assert user.receive_json()["type"] == "input_mode"
+            frame = bytes([4]) * FRAME_BYTES
+            user.send_bytes(frame)
+            assert callee.receive_bytes() == frame
+            assert room.audio_queue.empty()
+            user.send_json({"type": "input_mode", "mode": "transform"})
+            assert user.receive_json()["type"] == "input_mode"
+            user.send_bytes(bytes(FRAME_BYTES))
+            seen = []
+            while not any(item["type"] == "user_final" for item in seen):
+                seen.append(user.receive_json())
+            assert any(item["type"] == "user_partial" for item in seen)
+            assert room.audio_queue.empty()

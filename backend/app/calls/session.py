@@ -30,12 +30,25 @@ class CallSession:
     callee_socket: Any = None
     callee_joined: bool = False
     audio_queue: asyncio.Queue[bytes] = field(default_factory=lambda: asyncio.Queue(maxsize=64))
+    user_audio_queue: asyncio.Queue[bytes] = field(default_factory=lambda: asyncio.Queue(maxsize=64))
     settings_changed: asyncio.Event = field(default_factory=asyncio.Event)
+    user_mode_changed: asyncio.Event = field(default_factory=asyncio.Event)
+    transform_gate: asyncio.Event = field(default_factory=asyncio.Event)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     expiry_task: asyncio.Task[None] | None = None
     turns: list[dict[str, str]] = field(default_factory=list)
     tts_chars: int = 0
     stt_error: str | None = None
+    detected_language: str = ""
+    input_mode: str = "type"
+    save_history: bool = False
+    persisted_transcript: list[dict[str, str]] = field(default_factory=list)
+    summary: dict[str, Any] | None = None
+    direct_audio: bool = False
+    transform_review: bool = True
+
+    def __post_init__(self) -> None:
+        self.transform_gate.set()
 
     @property
     def age_minutes(self) -> float:

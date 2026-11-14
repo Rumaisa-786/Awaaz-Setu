@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { EntityCards } from './EntityCards'
 import { ToneSelector } from './ToneSelector'
 import { Transcript } from './Transcript'
+import { InputModeSwitcher, MainNavigation, SaveSummaryToggle, SummaryDialog } from './ProductFeatures'
 
 let host: HTMLDivElement
 let root: Root
@@ -39,5 +40,31 @@ describe('call interface components', () => {
     expect(host.textContent).toContain('ta-IN')
     expect(host.textContent).toContain('230 ms STT')
     expect(host.querySelector('.volatile')?.textContent).toBe(' காலை')
+  })
+
+  it('switches among the three mid-call input modes', () => {
+    const onChange = vi.fn(); render(createElement(InputModeSwitcher, { value: 'type', onChange }))
+    expect(host.querySelectorAll('[aria-pressed="false"]')).toHaveLength(2)
+    act(() => Array.from(host.querySelectorAll('button')).find(button => button.textContent === 'Speak-Direct')!.click())
+    expect(onChange).toHaveBeenCalledWith('direct')
+  })
+
+  it('shows translated captions with their original language text', () => {
+    render(createElement(Transcript, { turns: [{ role: 'caller', text: 'வணக்கம்', translated_text: 'नमस्ते', language: 'ta-IN' }], stableText: '', volatileText: '' }))
+    expect(host.textContent).toContain('नमस्ते'); expect(host.textContent).toContain('Original: வணக்கம்')
+  })
+
+  it('keeps transcript saving opt-in and renders post-call summary', () => {
+    const changed = vi.fn(); render(createElement('div', null, createElement(SaveSummaryToggle, { checked: false, onChange: changed }), createElement(SummaryDialog, { summary: { plain_language_summary: 'Appointment is tomorrow' }, saved: false, onClose: vi.fn() })))
+    const toggle = host.querySelector('input[type="checkbox"]') as HTMLInputElement
+    expect(toggle.checked).toBe(false); act(() => { toggle.click() }); expect(changed).toHaveBeenCalledWith(true)
+    expect(host.querySelector('[role="dialog"]')?.textContent).toContain('Appointment is tomorrow')
+  })
+
+  it('provides product navigation for home, history and settings', () => {
+    const navigate = vi.fn(); render(createElement(MainNavigation, { onNavigate: navigate }))
+    expect(host.textContent).toContain('Home'); expect(host.textContent).toContain('History'); expect(host.textContent).toContain('Settings')
+    act(() => Array.from(host.querySelectorAll('button')).find(button => button.textContent === 'History')!.click())
+    expect(navigate).toHaveBeenCalledWith('/history')
   })
 })

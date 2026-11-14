@@ -1,5 +1,5 @@
 export type Tone = 'neutral' | 'warm' | 'polite' | 'urgent' | 'apologetic'
-export type TranscriptTurn = { role: 'caller' | 'user'; text: string; language?: string; latency?: number }
+export type TranscriptTurn = { role: 'caller' | 'user'; text: string; translated_text?: string; language?: string; latency?: number }
 export type Entity = { type: string; value: string; start?: number; end?: number }
 export type CallConfig = { goal: string; user_language: string; callee_language: string; voice: string; tone: Tone; keyterms: string[]; use_keyterms: boolean }
 

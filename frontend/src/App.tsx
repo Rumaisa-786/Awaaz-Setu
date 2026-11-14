@@ -1,37 +1,61 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { AlertTriangle, ArrowLeft, Clipboard, Mic, MicOff, Phone, PhoneOff, Send, ShieldCheck } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Clipboard, Mic, MicOff, Phone, PhoneOff, Send, ShieldCheck, History, Settings } from 'lucide-react'
 import { api, websocketUrl } from './lib/api'
 import { EntityCards } from './components/EntityCards'
 import { ToneSelector } from './components/ToneSelector'
 import { Transcript } from './components/Transcript'
 import { LANGUAGES, TONES, VOICES, type CallConfig, type Entity, type Tone, type TranscriptTurn } from './lib/types'
-
+import { supabase, supabaseConfigured } from './lib/supabase'
+import { InputModeSwitcher, MainNavigation, SaveSummaryToggle, SummaryDialog, type InputMode } from './components/ProductFeatures'
 type CreatedCall = { code: string; user_token: string }
 type RoomInfo = { code: string; state: string; goal: string; callee_connected: boolean }
 type WSEvent = Record<string, any> & { type: string }
-
 const defaultConfig: CallConfig = { goal: '', user_language: 'en-IN', callee_language: 'indic-auto', voice: 'Shivani', tone: 'neutral', keyterms: [], use_keyterms: true }
-
 function storedConfig(code: string): CallConfig {
   try { return JSON.parse(sessionStorage.getItem(`awaaz-config:${code}`) || 'null') || defaultConfig } catch { return defaultConfig }
 }
-
 function routeFromPath() {
   const join = location.pathname.match(/^\/join\/([^/]+)/)
   const call = location.pathname.match(/^\/call\/([^/]+)/)
-  return join ? { page: 'join', code: join[1] } : call ? { page: 'call', code: call[1] } : { page: 'home', code: '' }
+  if (join) return { page: 'join', code: join[1] }
+  if (call) return { page: 'call', code: call[1] }
+  return { page: location.pathname.replace(/^\//, '') || 'home', code: '' }
 }
-
 export default function App() {
   const [route, setRoute] = useState(routeFromPath)
   useEffect(() => { const update = () => setRoute(routeFromPath()); window.addEventListener('popstate', update); return () => window.removeEventListener('popstate', update) }, [])
-  return route.page === 'join' ? <CalleeJoin code={route.code}/> : route.page === 'call' ? <UserCall code={route.code}/> : <CallSetup/>
+  return route.page === 'join' ? <CalleeJoin code={route.code}/> : route.page === 'call' ? <UserCall code={route.code}/> : route.page === 'setup' ? <CallSetup/> : <ProductHome page={route.page}/>
 }
-
+function ProductHome({ page }: { page: string }) {
+  const [email, setEmail] = useState(''); const [password, setPassword] = useState(''); const [message, setMessage] = useState('')
+  const [historyItems, setHistoryItems] = useState<any[]>(() => { try { return JSON.parse(localStorage.getItem('awaaz-history') || '[]') } catch { return [] } })
+  useEffect(() => { if (page === 'history' && supabase) { void (async () => { const { data: { user } } = await supabase.auth.getUser(); if (!user) return; const { data } = await supabase.from('call_sessions').select('started_at,summary').eq('user_id', user.id).eq('saved', true).order('started_at', { ascending: false }).limit(100); if (data) setHistoryItems(data.map(item => ({ date: new Date(item.started_at).toLocaleString(), summary: item.summary }))) })() } }, [page])
+  async function signIn() {
+    if (!supabase) return
+    const result = await supabase.auth.signInWithPassword({ email, password })
+    if (result.error) { setMessage(result.error.message); return }
+    if (result.data.session?.access_token) localStorage.setItem('awaaz-access-token', result.data.session.access_token)
+    setMessage('Signed in successfully.')
+  }
+  async function signUp() {
+    if (!supabase) return
+    const result = await supabase.auth.signUp({ email, password })
+    setMessage(result.error?.message || 'Check your email to finish creating your account.')
+  }
+  async function googleSignIn() {
+    if (!supabase) return
+    const result = await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: location.origin } })
+    if (result.error) setMessage(result.error.message)
+  }
+  function nav(path: string) { history.pushState({}, '', path); window.dispatchEvent(new PopStateEvent('popstate')) }
+  return <main className="product-wrap"><Brand/><header className="home-intro"><span className="eyebrow">ACCESSIBLE CALLS</span><h1>{page === 'history' ? 'Call history' : page === 'settings' ? 'Accessibility & voice settings' : 'A clearer way to connect'}</h1><p>Voice relay in Indian languages, with your privacy in your hands.</p></header>
+    {page === 'history' ? <section className="setup-card">{historyItems.length ? historyItems.map((item, index) => <article className="history-item" key={index}><strong>{item.date}</strong><p>{item.summary?.plain_language_summary}</p></article>) : <p>Saved calls appear here when you opt in to saving a summary.</p>}</section> : page === 'settings' ? <section className="setup-card"><label className="field-label">Caption text size<select className="input" onChange={event => document.documentElement.style.setProperty('--caption-size', `${event.target.value}px`)}><option value="18">Comfortable</option><option value="22">Large</option><option value="26">Extra large</option></select></label><p className="privacy-note">Calls are never recorded. Transcript and summary saving is off by default.</p></section> : <section className="setup-card home-card"><button className="button primary full" onClick={() => nav('/setup')}><Phone size={18}/>New Call</button><div className="home-links"><button className="button secondary" onClick={() => nav('/history')}><History size={17}/>Call History</button><button className="button secondary" onClick={() => nav('/settings')}><Settings size={17}/>Accessibility &amp; Voice Settings</button></div><div className="auth-panel"><h2>{supabaseConfigured ? 'Sign in or create an account' : 'Continue as Guest (Local Demo Mode)'}</h2>{supabaseConfigured ? <><input className="input" type="email" aria-label="Email" value={email} onChange={event => setEmail(event.target.value)} placeholder="Email"/><input className="input" type="password" aria-label="Password" value={password} onChange={event => setPassword(event.target.value)} placeholder="Password"/><button className="button secondary" onClick={signIn}>Sign in</button><button className="button secondary" onClick={signUp}>Create account</button><button className="button secondary" onClick={googleSignIn}>Continue with Google</button></> : <p>Your calls work without an account. History is stored on this device only, and only when you choose to save it.</p>}{message && <p role="status">{message}</p>}</div></section>}
+    <MainNavigation onNavigate={nav}/>
+  </main>
+}
 function Brand({ back }: { back?: boolean }) {
   return <header className="brandbar"><div className="brand-mark" aria-hidden="true"><span/></div><div><strong>Awaaz Setu</strong><small>Voice bridge</small></div>{back && <a className="back-link" href="/"><ArrowLeft size={17}/>Setup</a>}</header>
 }
-
 function CallSetup() {
   const [config, setConfig] = useState<CallConfig>(defaultConfig)
   const [terms, setTerms] = useState('clinic, appointment, doctor')
@@ -39,7 +63,6 @@ function CallSetup() {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const contextTerms = useMemo(() => terms.split(/[\n,]/).map(term => term.trim()).filter(Boolean).slice(0, 20), [terms])
-
   async function create(event: FormEvent) {
     event.preventDefault(); setError(''); setBusy(true)
     try {
@@ -51,7 +74,6 @@ function CallSetup() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not create a call.') }
     finally { setBusy(false) }
   }
-
   return <main className="setup-wrap"><Brand/>
     <section className="setup-card">
       <div className="intro-copy"><span className="eyebrow">PRIVATE, LINK-BASED CALL</span><h1>Set up your call</h1><p>Choose how the reply should sound and add context that helps captions recognise names.</p></div>
@@ -76,7 +98,6 @@ function CallSetup() {
     </section>
   </main>
 }
-
 function UserCall({ code }: { code: string }) {
   const token = sessionStorage.getItem(`awaaz-token:${code}`) || ''
   const initial = storedConfig(code)
@@ -99,7 +120,18 @@ function UserCall({ code }: { code: string }) {
   const [preview, setPreview] = useState('')
   const [elapsed, setElapsed] = useState(0)
   const [linkCopied, setLinkCopied] = useState(false)
-
+  const [mode, setMode] = useState<InputMode>('type')
+  const [micOn, setMicOn] = useState(false)
+  const [micLevel, setMicLevel] = useState(0)
+  const [userPartial, setUserPartial] = useState('')
+  const [transformText, setTransformText] = useState('')
+  const [autoSend, setAutoSend] = useState(false)
+  const [saveAfterCall, setSaveAfterCall] = useState(false)
+  const [summary, setSummary] = useState<any>(null)
+  const micStream = useRef<MediaStream|null>(null)
+  const micContext = useRef<AudioContext|null>(null)
+  const micProcessor = useRef<AudioWorkletNode|null>(null)
+  const detected = turns.slice().reverse().find(turn => turn.role === 'caller' && turn.language)?.language || initial.callee_language
   useEffect(() => {
     const connect = () => {
       const ws = new WebSocket(websocketUrl(`/ws/call/user/${code}`)); socket.current = ws
@@ -113,14 +145,19 @@ function UserCall({ code }: { code: string }) {
           case 'speech_start': setStatus('Caller is speaking'); break
           case 'speech_end': setStatus('Your turn'); break
           case 'final_transcript':
-            setTurns(current => [...current, { role: 'caller', text: data.text, language: data.detected_language_code, latency: data.latency }]); setStable(''); setVolatile(''); setStatus('Your turn'); break
+            setTurns(current => [...current, { role: 'caller', text: data.text, translated_text: data.translated_text, language: data.detected_language_code, latency: data.latency }]); setStable(''); setVolatile(''); setStatus('Your turn'); break
+          case 'caption_translation': setTurns(current => current.map((turn, index) => index === data.turn_index ? { ...turn, translated_text: data.text } : turn)); break
+          case 'user_reply': setTurns(current => [...current, { role: 'user', text: data.text, translated_text: data.spoken_text, language: data.language }]); break
           case 'entities': case 'entity_confirmation':
-            setEntities((data.entities || data.confirmed_entities || []).map((entity: any) => typeof entity === 'string' ? { type: 'detail', value: entity } : entity)); setRisk(Boolean(data.otp_pin_cvv_request)); break
+            setEntities(current => { const incoming = (data.entities || data.confirmed_entities || []).map((entity: any) => typeof entity === 'string' ? { type: 'detail', value: entity } : entity); const all = new Map(current.concat(incoming).map(entity => [`${entity.type}:${entity.value}`, entity])); return [...all.values()] }); setRisk(current => current || Boolean(data.otp_pin_cvv_request)); break
           case 'suggestions': setSuggestions(data.replies || []); break
           case 'tts_status': setStatus(data.state === 'synthesizing' ? 'Synthesizing' : data.state === 'speaking' ? 'Speaking' : data.state === 'delivered' ? 'Delivered' : 'Ready'); break
           case 'connection_status': setStatus(data.state === 'connected' ? 'Connected' : 'Reconnecting'); break
           case 'error': setError(data.message); break
           case 'tone_preview': setPreview(data.text || ''); break
+          case 'user_partial': setUserPartial(data.text || ''); break
+          case 'user_final': setTransformText(data.text || ''); setUserPartial(''); break
+          case 'transform_spoken': setTurns(current => [...current, { role: 'user', text: data.text, translated_text: data.spoken_text }]); break
           case 'call_ended': setStatus('Call ended'); ws.close(); break
         }
       }
@@ -130,28 +167,58 @@ function UserCall({ code }: { code: string }) {
     const cleanup = connect()
     return cleanup
   }, [code, token])
-
+  useEffect(() => { return () => { micProcessor.current?.disconnect(); micStream.current?.getTracks().forEach(track => track.stop()); void micContext.current?.close() } }, [])
   useEffect(() => { const timer = window.setInterval(() => setElapsed(value => value + 1), 1000); return () => clearInterval(timer) }, [])
   useEffect(() => { if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: 'context_settings', use_keyterms: useKeyterms, keyterms })) }, [useKeyterms, keyterms])
   useEffect(() => { if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: 'tone_settings', tone, voice })) }, [tone, voice])
-
+  useEffect(() => { if (connected && socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: 'input_mode', mode })) }, [connected, mode])
   function sendReply(value: string) {
     const clean = value.trim(); if (!clean || socket.current?.readyState !== WebSocket.OPEN) return
-    setError(''); setPreview(''); socket.current.send(JSON.stringify({ type: 'send_text', text: clean, tone, voice })); setText('')
+    setError(''); setPreview(''); socket.current.send(JSON.stringify({ type: 'send_text', text: clean, tone, voice, language: initial.user_language })); setText('')
   }
   async function endCall() {
-    try { await api(`/api/calls/${code}/end`, { method: 'POST', body: JSON.stringify({ user_token: token }) }) } catch { socket.current?.send(JSON.stringify({ type: 'end_call' })) }
-    setStatus('Call ended')
+    try {
+      const result = await api<any>(`/api/calls/${code}/end`, { method: 'POST', body: JSON.stringify({ user_token: token, save_history: saveAfterCall }) })
+      setSummary(result.summary)
+      if (saveAfterCall) {
+        const saved = JSON.parse(localStorage.getItem('awaaz-history') || '[]'); saved.unshift({ date: new Date().toLocaleString(), summary: result.summary, turns }); localStorage.setItem('awaaz-history', JSON.stringify(saved.slice(0, 100)))
+        if (supabase) {
+          const { data: { user } } = await supabase.auth.getUser()
+          if (user) {
+            const inserted = await supabase.from('call_sessions').insert({ user_id: user.id, ended_at: new Date().toISOString(), language_pair: { user: initial.user_language, caller: detected }, summary: result.summary, saved: true }).select('id').single()
+            if (!inserted.error && inserted.data) await supabase.from('opt_in_transcripts').insert({ call_session_id: inserted.data.id, user_id: user.id, turns })
+          }
+        }
+      }
+    } catch { socket.current?.send(JSON.stringify({ type: 'end_call' })) }
+    stopMic(); setStatus('Call ended')
   }
+  async function setInputMode(next: InputMode) {
+    if (mode === next) return
+    setMode(next)
+    if (next === 'type') { stopMic(); return }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+      const context = new AudioContext({ sampleRate: 16000 }); await context.audioWorklet.addModule('/src/pcm-worklet.js')
+      const source = context.createMediaStreamSource(stream); const worklet = new AudioWorkletNode(context, 'pcm16-processor', { numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1 }); const mute = context.createGain(); mute.gain.value = 0
+      source.connect(worklet); worklet.connect(mute); mute.connect(context.destination)
+      worklet.port.onmessage = event => { if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(event.data); const bytes = new Int16Array(event.data); let sum = 0; bytes.forEach(n => { sum += n*n }); setMicLevel(Math.min(1, Math.sqrt(sum / bytes.length) / 14000)) }
+      micStream.current = stream; micContext.current = context; micProcessor.current = worklet; setMicOn(true)
+    } catch { setError('Microphone access is needed for this speaking mode.'); setMode('type'); socket.current?.send(JSON.stringify({ type: 'input_mode', mode: 'type' })) }
+  }
+  function stopMic() { micProcessor.current?.disconnect(); micProcessor.current = null; micStream.current?.getTracks().forEach(track => track.stop()); micStream.current = null; void micContext.current?.close(); micContext.current = null; setMicOn(false); setMicLevel(0); setUserPartial('') }
+  function toggleMute() { const next = !micOn; setMicOn(next); micStream.current?.getAudioTracks().forEach(track => track.enabled = next) }
+  function chooseLanguage(language: string) { socket.current?.send(JSON.stringify({ type: 'language_override', language })) }
+  function speakReviewed() { if (transformText.trim()) { socket.current?.send(JSON.stringify({ type: 'send_transform', text: transformText })); setTransformText('') } }
   async function previewTone() {
     if (socket.current?.readyState === WebSocket.OPEN && text.trim()) { socket.current.send(JSON.stringify({ type: 'preview_tone', text, tone })); setPreview('Tone preview requested…') }
   }
   function readBack(entity: Entity) { sendReply(`Just to confirm: ${entity.value}`) }
   async function copyJoinLink() { await navigator.clipboard.writeText(`${location.origin}/join/${code}`); setLinkCopied(true); window.setTimeout(() => setLinkCopied(false), 1800) }
-
   return <main className="call-page"><Brand back/><header className="call-header">
     <div><span className={`status-dot ${connected ? 'online' : ''}`}/><span>{calleeConnected ? 'Caller joined' : status}</span><span className="timer">{Math.floor(elapsed / 60).toString().padStart(2, '0')}:{(elapsed % 60).toString().padStart(2, '0')}</span></div>
     <label className="compact-toggle"><span>Context keyterms</span><input aria-label="Use context keyterms" type="checkbox" checked={useKeyterms} onChange={event => setUseKeyterms(event.target.checked)}/></label>
+    <div className="language-pill"><span>Caller: {LANGUAGES.find(item => item[0] === detected)?.[1] || (detected === 'indic-auto' ? 'Detecting…' : detected)} ({detected}) → You: {LANGUAGES.find(item => item[0] === initial.user_language)?.[1]} ({initial.user_language})</span><select aria-label="Correct caller language" value={LANGUAGES.some(item => item[0] === detected) ? detected : 'indic-auto'} onChange={event => chooseLanguage(event.target.value)}><option value="indic-auto">Auto detect</option>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></div>
     <div className="call-actions"><button className="button secondary copy-call" onClick={copyJoinLink}><Clipboard size={17}/>{linkCopied ? 'Copied' : 'Join link'}</button><button className="button danger" onClick={endCall}><PhoneOff size={17}/>End call</button></div>
   </header>
   {error && <div className="inline-error" role="alert"><AlertTriangle size={17}/>{error}</div>}
@@ -161,17 +228,23 @@ function UserCall({ code }: { code: string }) {
     {!calleeConnected && <div className="waiting-state"><span className="pulse-dot"/>Waiting for the other caller to join</div>}
   </section>
   <section className="composer-card">
-    <div className="composer-top"><strong>Suggested replies</strong><span>{suggestions.length ? 'In the caller’s language' : 'Suggestions appear after the caller speaks'}</span></div>
+    <InputModeSwitcher value={mode} onChange={value => void setInputMode(value)}/>
+    {mode !== 'type' && <div className="mic-mode-panel"><div><strong>{mode === 'direct' ? 'Your live voice is being heard by caller' : 'Speak your reply'}</strong>{mode === 'transform' && <p>{userPartial || 'Live transcript preview will appear here.'}</p>}<div className="mic-meter" aria-label="Microphone level"><span style={{ width: `${Math.round(micLevel * 100)}%` }}/></div></div><button className="button secondary" onClick={toggleMute}>{micOn ? <MicOff size={18}/> : <Mic size={18}/>} {micOn ? 'Mute' : 'Unmute'}</button></div>}
+    {mode === 'transform' && <div className="transform-review"><label className="toggle-row"><span><strong>Auto-send on pause</strong><small>Otherwise review before speaking</small></span><input type="checkbox" checked={autoSend} onChange={event => { const enabled = event.target.checked; setAutoSend(enabled); socket.current?.send(JSON.stringify({ type:'transform_settings', behavior: enabled ? 'auto' : 'review' })) }}/></label>{transformText && <><p>You said: {transformText}</p><button className="button primary" onClick={speakReviewed}>Translate &amp; speak</button></>}</div>}
+    {mode === 'type' && <>
+    <div className="composer-top"><strong>Suggested replies</strong><span>{suggestions.length ? 'In your language' : 'Suggestions appear after the caller speaks'}</span></div>
     {suggestions.length > 0 && <div className="suggestions">{suggestions.slice(0, 3).map((reply, index) => <button key={`${reply}-${index}`} onClick={() => sendReply(reply)}>{reply}</button>)}</div>}
     <div className="composer-tone"><ToneSelector value={tone} onChange={setTone} compact/><label className="voice-select">Voice<select value={voice} onChange={event => setVoice(event.target.value)}>{VOICES.map(item => <option key={item}>{item}</option>)}</select></label></div>
     <form className="reply-form" onSubmit={event => { event.preventDefault(); sendReply(text) }}><input aria-label="Type your reply" className="input" value={text} maxLength={1000} onChange={event => { setText(event.target.value); if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: 'typing' })) }} placeholder="Type a reply for the caller"/><button type="button" className="button secondary preview-button" onClick={previewTone} disabled={!text.trim()}>Preview tone</button><button className="button primary" disabled={!text.trim() || !connected}><Send size={17}/>Send</button></form>
     {preview && <p className="preview-text" aria-live="polite">{preview}</p>}
     <div className="composer-status"><span className={`status-dot ${connected ? 'online' : ''}`}/>{status}</div>
+    </>}
   </section>
+  <SaveSummaryToggle checked={saveAfterCall} onChange={setSaveAfterCall}/>
   <p className="privacy-note"><ShieldCheck size={16}/>Call audio is processed for captions and speech and is not stored.</p>
+  {summary && <SummaryDialog summary={summary} entities={entities} saved={saveAfterCall} onClose={() => { setSummary(null); history.pushState({}, '', '/'); window.dispatchEvent(new PopStateEvent('popstate')) }}/>}
   </main>
 }
-
 function CalleeJoin({ code }: { code: string }) {
   const [room, setRoom] = useState<RoomInfo | null>(null)
   const [joined, setJoined] = useState(false)
@@ -183,10 +256,9 @@ function CalleeJoin({ code }: { code: string }) {
   const audioContext = useRef<AudioContext | null>(null)
   const mediaStream = useRef<MediaStream | null>(null)
   const audioChunks = useRef<Uint8Array[]>([])
-
+  const directPlaybackAt = useRef(0)
   useEffect(() => { api<RoomInfo>(`/api/calls/${code}`).then(setRoom).catch(cause => setError(cause.message || 'This call link is no longer available.')) }, [code])
   useEffect(() => () => { socket.current?.close(); mediaStream.current?.getTracks().forEach(track => track.stop()); void audioContext.current?.close() }, [])
-
   async function joinCall() {
     setError(''); setConnecting(true)
     try {
@@ -204,6 +276,7 @@ function CalleeJoin({ code }: { code: string }) {
       source.connect(processor); processor.connect(silent); silent.connect(context.destination)
       processor.port.onmessage = event => { if (micEnabled && ws.readyState === WebSocket.OPEN) ws.send(event.data) }
       ws.onmessage = event => {
+        if (event.data instanceof ArrayBuffer) { playDirectFrame(event.data); return }
         if (typeof event.data === 'string') {
           const data = JSON.parse(event.data) as WSEvent
           if (data.type === 'user_status') setUserStatus(data.state === 'typing' ? 'The user is typing a reply' : data.state === 'speaking' ? 'The user is speaking' : 'The user has replied')
@@ -221,7 +294,6 @@ function CalleeJoin({ code }: { code: string }) {
       setError(cause instanceof Error ? cause.message : 'Could not join the call.')
     } finally { setConnecting(false) }
   }
-
   async function playAudioChunks() {
     const chunks = audioChunks.current; audioChunks.current = []
     if (!chunks.length || !audioContext.current) return
@@ -232,12 +304,18 @@ function CalleeJoin({ code }: { code: string }) {
       const source = audioContext.current.createBufferSource(); source.buffer = audio; source.connect(audioContext.current.destination); source.onended = () => setUserStatus('Waiting for the user to reply'); source.start()
     } catch { setError('The received audio could not be played. Please ask the user to resend the reply.') }
   }
-
+  function playDirectFrame(frame: ArrayBuffer) {
+    const context = audioContext.current
+    if (!context || frame.byteLength !== 1024) return
+    const view = new DataView(frame); const buffer = context.createBuffer(1, 512, 16000); const samples = buffer.getChannelData(0)
+    for (let i = 0; i < 512; i++) samples[i] = view.getInt16(i * 2, true) / 32768
+    const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination)
+    const now = context.currentTime; directPlaybackAt.current = Math.max(now + .01, directPlaybackAt.current); source.start(directPlaybackAt.current); directPlaybackAt.current += buffer.duration
+  }
   function toggleMic() {
     const next = !micEnabled; setMicEnabled(next); mediaStream.current?.getAudioTracks().forEach(track => { track.enabled = next })
   }
   function leave() { socket.current?.send(JSON.stringify({ type: 'leave' })); socket.current?.close(); mediaStream.current?.getTracks().forEach(track => track.stop()); setJoined(false) }
-
   return <main className="callee-wrap"><Brand/>
     <section className="callee-card">
       <div className="callee-icon"><Phone size={25}/></div>
