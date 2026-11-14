@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     session_request_limit: int = Field(default=100, ge=0)
     daily_audio_minutes_limit: float = Field(default=120.0, ge=0)
     session_duration_minutes_limit: float = Field(default=15.0, gt=0)
+    max_concurrent_calls: int = Field(default=10, ge=1)
+    call_max_minutes: float = Field(default=15.0, gt=0)
+    tts_daily_char_limit: int = Field(default=50_000, ge=1)
+    tts_session_char_limit: int = Field(default=5_000, ge=1)
+    prisma_reconnect_seconds: float = Field(default=1.0, ge=0.1, le=30)
 
 
 @lru_cache

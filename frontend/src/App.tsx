@@ -1,0 +1,255 @@
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { AlertTriangle, ArrowLeft, Clipboard, Mic, MicOff, Phone, PhoneOff, Send, ShieldCheck } from 'lucide-react'
+import { api, websocketUrl } from './lib/api'
+import { EntityCards } from './components/EntityCards'
+import { ToneSelector } from './components/ToneSelector'
+import { Transcript } from './components/Transcript'
+import { LANGUAGES, TONES, VOICES, type CallConfig, type Entity, type Tone, type TranscriptTurn } from './lib/types'
+
+type CreatedCall = { code: string; user_token: string }
+type RoomInfo = { code: string; state: string; goal: string; callee_connected: boolean }
+type WSEvent = Record<string, any> & { type: string }
+
+const defaultConfig: CallConfig = { goal: '', user_language: 'en-IN', callee_language: 'indic-auto', voice: 'Shivani', tone: 'neutral', keyterms: [], use_keyterms: true }
+
+function storedConfig(code: string): CallConfig {
+  try { return JSON.parse(sessionStorage.getItem(`awaaz-config:${code}`) || 'null') || defaultConfig } catch { return defaultConfig }
+}
+
+function routeFromPath() {
+  const join = location.pathname.match(/^\/join\/([^/]+)/)
+  const call = location.pathname.match(/^\/call\/([^/]+)/)
+  return join ? { page: 'join', code: join[1] } : call ? { page: 'call', code: call[1] } : { page: 'home', code: '' }
+}
+
+export default function App() {
+  const [route, setRoute] = useState(routeFromPath)
+  useEffect(() => { const update = () => setRoute(routeFromPath()); window.addEventListener('popstate', update); return () => window.removeEventListener('popstate', update) }, [])
+  return route.page === 'join' ? <CalleeJoin code={route.code}/> : route.page === 'call' ? <UserCall code={route.code}/> : <CallSetup/>
+}
+
+function Brand({ back }: { back?: boolean }) {
+  return <header className="brandbar"><div className="brand-mark" aria-hidden="true"><span/></div><div><strong>Awaaz Setu</strong><small>Voice bridge</small></div>{back && <a className="back-link" href="/"><ArrowLeft size={17}/>Setup</a>}</header>
+}
+
+function CallSetup() {
+  const [config, setConfig] = useState<CallConfig>(defaultConfig)
+  const [terms, setTerms] = useState('clinic, appointment, doctor')
+  const [expanded, setExpanded] = useState(false)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const contextTerms = useMemo(() => terms.split(/[\n,]/).map(term => term.trim()).filter(Boolean).slice(0, 20), [terms])
+
+  async function create(event: FormEvent) {
+    event.preventDefault(); setError(''); setBusy(true)
+    try {
+      const result = await api<CreatedCall>('/api/calls', { method: 'POST', body: JSON.stringify({ ...config, keyterms: contextTerms }) })
+      sessionStorage.setItem(`awaaz-token:${result.code}`, result.user_token)
+      sessionStorage.setItem(`awaaz-config:${result.code}`, JSON.stringify({ ...config, keyterms: contextTerms }))
+      history.pushState({}, '', `/call/${result.code}`)
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not create a call.') }
+    finally { setBusy(false) }
+  }
+
+  return <main className="setup-wrap"><Brand/>
+    <section className="setup-card">
+      <div className="intro-copy"><span className="eyebrow">PRIVATE, LINK-BASED CALL</span><h1>Set up your call</h1><p>Choose how the reply should sound and add context that helps captions recognise names.</p></div>
+      {error && <div className="inline-error" role="alert"><AlertTriangle size={18}/>{error}</div>}
+      <form onSubmit={create}>
+        <label className="field-label" htmlFor="goal">What is this call about?</label>
+        <input id="goal" className="input" value={config.goal} onChange={event => setConfig({ ...config, goal: event.target.value })} placeholder="For example, book a clinic appointment" maxLength={500}/>
+        <div className="field-grid">
+          <label>User language<select className="input" value={config.user_language} onChange={event => setConfig({ ...config, user_language: event.target.value })}>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
+          <label>Caller language hint<select className="input" value={config.callee_language} onChange={event => setConfig({ ...config, callee_language: event.target.value })}><option value="indic-auto">Automatic detection</option>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
+          <label>Voice<select className="input" value={config.voice} onChange={event => setConfig({ ...config, voice: event.target.value })}>{VOICES.map(voice => <option key={voice}>{voice}</option>)}</select></label>
+          <label>Default tone<select className="input" value={config.tone} onChange={event => setConfig({ ...config, tone: event.target.value as Tone })}>{TONES.map(tone => <option key={tone.value} value={tone.value}>{tone.label}</option>)}</select></label>
+        </div>
+        <div className="context-panel">
+          <button type="button" className="context-expand" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><span><strong>Context card</strong><small>Optional terms for names, places, or services</small></span><span aria-hidden="true">{expanded ? '−' : '+'}</span></button>
+          {expanded && <div className="context-body"><label htmlFor="terms">Keyterms (up to 20)</label><textarea id="terms" className="input textarea" value={terms} onChange={event => setTerms(event.target.value)} placeholder="Clinic, doctor's name, medicine"/><p>Terms are sent to Prisma only while keyterms are enabled. You can turn them off during the call to compare recognition.</p></div>}
+          <label className="toggle-row"><span><strong>Use context keyterms</strong><small>Switch off to compare captions without hints</small></span><input type="checkbox" checked={config.use_keyterms} onChange={event => setConfig({ ...config, use_keyterms: event.target.checked })}/><span className="switch" aria-hidden="true"/></label>
+        </div>
+        <button className="button primary full create-button" disabled={busy}>{busy ? 'Creating call…' : <><Phone size={18}/>Create call</>}</button>
+      </form>
+      <p className="privacy-note"><ShieldCheck size={16}/>Assistive relay. Calls are not recorded by this prototype.</p>
+    </section>
+  </main>
+}
+
+function UserCall({ code }: { code: string }) {
+  const token = sessionStorage.getItem(`awaaz-token:${code}`) || ''
+  const initial = storedConfig(code)
+  const socket = useRef<WebSocket | null>(null)
+  const [connected, setConnected] = useState(false)
+  const [calleeConnected, setCalleeConnected] = useState(false)
+  const [turns, setTurns] = useState<TranscriptTurn[]>([])
+  const [stable, setStable] = useState('')
+  const [volatile, setVolatile] = useState('')
+  const [entities, setEntities] = useState<Entity[]>([])
+  const [risk, setRisk] = useState(false)
+  const [suggestions, setSuggestions] = useState<string[]>([])
+  const [text, setText] = useState('')
+  const [tone, setTone] = useState<Tone>(initial.tone)
+  const [voice, setVoice] = useState(initial.voice)
+  const [useKeyterms, setUseKeyterms] = useState(initial.use_keyterms)
+  const [keyterms] = useState<string[]>(initial.keyterms)
+  const [status, setStatus] = useState('Connecting')
+  const [error, setError] = useState('')
+  const [preview, setPreview] = useState('')
+  const [elapsed, setElapsed] = useState(0)
+  const [linkCopied, setLinkCopied] = useState(false)
+
+  useEffect(() => {
+    const connect = () => {
+      const ws = new WebSocket(websocketUrl(`/ws/call/user/${code}`)); socket.current = ws
+      ws.onopen = () => { ws.send(JSON.stringify({ type: 'auth', token })); ws.send(JSON.stringify({ type: 'context_settings', use_keyterms: useKeyterms, keyterms })) }
+      ws.onmessage = event => {
+        const data = JSON.parse(event.data) as WSEvent
+        switch (data.type) {
+          case 'connected': setConnected(true); setStatus(data.mock_mode ? 'Mock mode' : 'Connected'); break
+          case 'callee_status': setCalleeConnected(data.state === 'connected'); break
+          case 'partial_transcript': setStable(data.stable_text || ''); setVolatile(data.volatile_text || ''); setStatus('Caller is speaking'); break
+          case 'speech_start': setStatus('Caller is speaking'); break
+          case 'speech_end': setStatus('Your turn'); break
+          case 'final_transcript':
+            setTurns(current => [...current, { role: 'caller', text: data.text, language: data.detected_language_code, latency: data.latency }]); setStable(''); setVolatile(''); setStatus('Your turn'); break
+          case 'entities': case 'entity_confirmation':
+            setEntities((data.entities || data.confirmed_entities || []).map((entity: any) => typeof entity === 'string' ? { type: 'detail', value: entity } : entity)); setRisk(Boolean(data.otp_pin_cvv_request)); break
+          case 'suggestions': setSuggestions(data.replies || []); break
+          case 'tts_status': setStatus(data.state === 'synthesizing' ? 'Synthesizing' : data.state === 'speaking' ? 'Speaking' : data.state === 'delivered' ? 'Delivered' : 'Ready'); break
+          case 'connection_status': setStatus(data.state === 'connected' ? 'Connected' : 'Reconnecting'); break
+          case 'error': setError(data.message); break
+          case 'tone_preview': setPreview(data.text || ''); break
+          case 'call_ended': setStatus('Call ended'); ws.close(); break
+        }
+      }
+      ws.onclose = () => { setConnected(false); setStatus('Disconnected') }
+      return () => ws.close()
+    }
+    const cleanup = connect()
+    return cleanup
+  }, [code, token])
+
+  useEffect(() => { const timer = window.setInterval(() => setElapsed(value => value + 1), 1000); return () => clearInterval(timer) }, [])
+  useEffect(() => { if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: 'context_settings', use_keyterms: useKeyterms, keyterms })) }, [useKeyterms, keyterms])
+  useEffect(() => { if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: 'tone_settings', tone, voice })) }, [tone, voice])
+
+  function sendReply(value: string) {
+    const clean = value.trim(); if (!clean || socket.current?.readyState !== WebSocket.OPEN) return
+    setError(''); setPreview(''); socket.current.send(JSON.stringify({ type: 'send_text', text: clean, tone, voice })); setText('')
+  }
+  async function endCall() {
+    try { await api(`/api/calls/${code}/end`, { method: 'POST', body: JSON.stringify({ user_token: token }) }) } catch { socket.current?.send(JSON.stringify({ type: 'end_call' })) }
+    setStatus('Call ended')
+  }
+  async function previewTone() {
+    if (socket.current?.readyState === WebSocket.OPEN && text.trim()) { socket.current.send(JSON.stringify({ type: 'preview_tone', text, tone })); setPreview('Tone preview requested…') }
+  }
+  function readBack(entity: Entity) { sendReply(`Just to confirm: ${entity.value}`) }
+  async function copyJoinLink() { await navigator.clipboard.writeText(`${location.origin}/join/${code}`); setLinkCopied(true); window.setTimeout(() => setLinkCopied(false), 1800) }
+
+  return <main className="call-page"><Brand back/><header className="call-header">
+    <div><span className={`status-dot ${connected ? 'online' : ''}`}/><span>{calleeConnected ? 'Caller joined' : status}</span><span className="timer">{Math.floor(elapsed / 60).toString().padStart(2, '0')}:{(elapsed % 60).toString().padStart(2, '0')}</span></div>
+    <label className="compact-toggle"><span>Context keyterms</span><input aria-label="Use context keyterms" type="checkbox" checked={useKeyterms} onChange={event => setUseKeyterms(event.target.checked)}/></label>
+    <div className="call-actions"><button className="button secondary copy-call" onClick={copyJoinLink}><Clipboard size={17}/>{linkCopied ? 'Copied' : 'Join link'}</button><button className="button danger" onClick={endCall}><PhoneOff size={17}/>End call</button></div>
+  </header>
+  {error && <div className="inline-error" role="alert"><AlertTriangle size={17}/>{error}</div>}
+  <section className="conversation-card">
+    <EntityCards entities={entities} risk={risk} onReadBack={readBack} onDecision={(entity, action) => setEntities(current => current.filter(item => item !== entity))}/>
+    <Transcript turns={turns} stableText={stable} volatileText={volatile}/>
+    {!calleeConnected && <div className="waiting-state"><span className="pulse-dot"/>Waiting for the other caller to join</div>}
+  </section>
+  <section className="composer-card">
+    <div className="composer-top"><strong>Suggested replies</strong><span>{suggestions.length ? 'In the caller’s language' : 'Suggestions appear after the caller speaks'}</span></div>
+    {suggestions.length > 0 && <div className="suggestions">{suggestions.slice(0, 3).map((reply, index) => <button key={`${reply}-${index}`} onClick={() => sendReply(reply)}>{reply}</button>)}</div>}
+    <div className="composer-tone"><ToneSelector value={tone} onChange={setTone} compact/><label className="voice-select">Voice<select value={voice} onChange={event => setVoice(event.target.value)}>{VOICES.map(item => <option key={item}>{item}</option>)}</select></label></div>
+    <form className="reply-form" onSubmit={event => { event.preventDefault(); sendReply(text) }}><input aria-label="Type your reply" className="input" value={text} maxLength={1000} onChange={event => { setText(event.target.value); if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: 'typing' })) }} placeholder="Type a reply for the caller"/><button type="button" className="button secondary preview-button" onClick={previewTone} disabled={!text.trim()}>Preview tone</button><button className="button primary" disabled={!text.trim() || !connected}><Send size={17}/>Send</button></form>
+    {preview && <p className="preview-text" aria-live="polite">{preview}</p>}
+    <div className="composer-status"><span className={`status-dot ${connected ? 'online' : ''}`}/>{status}</div>
+  </section>
+  <p className="privacy-note"><ShieldCheck size={16}/>Call audio is processed for captions and speech and is not stored.</p>
+  </main>
+}
+
+function CalleeJoin({ code }: { code: string }) {
+  const [room, setRoom] = useState<RoomInfo | null>(null)
+  const [joined, setJoined] = useState(false)
+  const [connecting, setConnecting] = useState(false)
+  const [micEnabled, setMicEnabled] = useState(true)
+  const [userStatus, setUserStatus] = useState('Waiting for the user to reply')
+  const [error, setError] = useState('')
+  const socket = useRef<WebSocket | null>(null)
+  const audioContext = useRef<AudioContext | null>(null)
+  const mediaStream = useRef<MediaStream | null>(null)
+  const audioChunks = useRef<Uint8Array[]>([])
+
+  useEffect(() => { api<RoomInfo>(`/api/calls/${code}`).then(setRoom).catch(cause => setError(cause.message || 'This call link is no longer available.')) }, [code])
+  useEffect(() => () => { socket.current?.close(); mediaStream.current?.getTracks().forEach(track => track.stop()); void audioContext.current?.close() }, [])
+
+  async function joinCall() {
+    setError(''); setConnecting(true)
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone access is not available in this browser.')
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+      mediaStream.current = stream
+      const context = new AudioContext({ sampleRate: 16000 }); audioContext.current = context
+      await context.audioWorklet.addModule('/src/pcm-worklet.js')
+      const ws = new WebSocket(websocketUrl(`/ws/call/callee/${code}`)); socket.current = ws
+      ws.binaryType = 'arraybuffer'
+      await new Promise<void>((resolve, reject) => { ws.onopen = () => resolve(); ws.onerror = () => reject(new Error('Could not connect to the call.')) })
+      const source = context.createMediaStreamSource(stream)
+      const processor = new AudioWorkletNode(context, 'pcm16-processor', { numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1 })
+      const silent = context.createGain(); silent.gain.value = 0
+      source.connect(processor); processor.connect(silent); silent.connect(context.destination)
+      processor.port.onmessage = event => { if (micEnabled && ws.readyState === WebSocket.OPEN) ws.send(event.data) }
+      ws.onmessage = event => {
+        if (typeof event.data === 'string') {
+          const data = JSON.parse(event.data) as WSEvent
+          if (data.type === 'user_status') setUserStatus(data.state === 'typing' ? 'The user is typing a reply' : data.state === 'speaking' ? 'The user is speaking' : 'The user has replied')
+          if (data.type === 'tts_status') setUserStatus(data.state === 'speaking' ? 'The user is speaking' : userStatus)
+          if (data.type === 'audio_chunk' && data.audio) audioChunks.current.push(Uint8Array.from(atob(data.audio), character => character.charCodeAt(0)))
+          if (data.type === 'tts_complete') void playAudioChunks()
+          if (data.type === 'call_ended') { setJoined(false); setUserStatus('Call ended') }
+          if (data.type === 'error') setError(data.message)
+        }
+      }
+      ws.onclose = () => { setJoined(false); setConnecting(false) }
+      setJoined(true); setUserStatus('Connected'); setRoom(current => current ? { ...current, callee_connected: true, state: 'live' } : current)
+    } catch (cause) {
+      mediaStream.current?.getTracks().forEach(track => track.stop()); mediaStream.current = null
+      setError(cause instanceof Error ? cause.message : 'Could not join the call.')
+    } finally { setConnecting(false) }
+  }
+
+  async function playAudioChunks() {
+    const chunks = audioChunks.current; audioChunks.current = []
+    if (!chunks.length || !audioContext.current) return
+    const size = chunks.reduce((sum, chunk) => sum + chunk.length, 0); const joinedBytes = new Uint8Array(size)
+    let offset = 0; for (const chunk of chunks) { joinedBytes.set(chunk, offset); offset += chunk.length }
+    try {
+      const audio = await audioContext.current.decodeAudioData(joinedBytes.buffer.slice(0))
+      const source = audioContext.current.createBufferSource(); source.buffer = audio; source.connect(audioContext.current.destination); source.onended = () => setUserStatus('Waiting for the user to reply'); source.start()
+    } catch { setError('The received audio could not be played. Please ask the user to resend the reply.') }
+  }
+
+  function toggleMic() {
+    const next = !micEnabled; setMicEnabled(next); mediaStream.current?.getAudioTracks().forEach(track => { track.enabled = next })
+  }
+  function leave() { socket.current?.send(JSON.stringify({ type: 'leave' })); socket.current?.close(); mediaStream.current?.getTracks().forEach(track => track.stop()); setJoined(false) }
+
+  return <main className="callee-wrap"><Brand/>
+    <section className="callee-card">
+      <div className="callee-icon"><Phone size={25}/></div>
+      <span className="eyebrow">A secure call link</span>
+      <h1>{error && !room ? 'Call link unavailable' : joined ? 'You’re connected' : 'Join the call'}</h1>
+      <p className="disclosure">This call uses an assistive relay. Your speech is transcribed so the other person can read it and respond by voice. This prototype does not record calls.</p>
+      {error && <div className="inline-error" role="alert"><AlertTriangle size={18}/>{error}</div>}
+      {room && room.state !== 'ended' ? <>
+        <div className="join-status"><span className={`status-dot ${joined ? 'online' : ''}`}/>{joined ? userStatus : 'Your microphone stays off until you join.'}</div>
+        {!joined ? <button className="button primary full join-button" onClick={joinCall} disabled={connecting}><Mic size={18}/>{connecting ? 'Connecting…' : 'Join call'}</button> : <div className="join-controls"><button className="button secondary" onClick={toggleMic}>{micEnabled ? <MicOff size={18}/> : <Mic size={18}/>} {micEnabled ? 'Mute microphone' : 'Unmute microphone'}</button><button className="button danger" onClick={leave}><PhoneOff size={18}/>Leave call</button></div>}
+      </> : <p className="inline-error">This call has ended or the link has expired.</p>}
+      <p className="privacy-note"><ShieldCheck size={16}/>Your microphone audio is not played back locally.</p>
+    </section>
+  </main>
+}

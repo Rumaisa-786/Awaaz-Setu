@@ -1,9 +1,17 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
+import '@fontsource/noto-sans/400.css'
+import '@fontsource/noto-sans/500.css'
+import '@fontsource/noto-sans/600.css'
+import '@fontsource/noto-sans-devanagari/400.css'
+import '@fontsource/noto-sans-tamil/400.css'
+import '@fontsource/noto-sans-telugu/400.css'
+import '@fontsource/noto-sans-kannada/400.css'
+import '@fontsource/noto-sans-malayalam/400.css'
+import '@fontsource/noto-sans-bengali/400.css'
+import '@fontsource/noto-sans-gujarati/400.css'
+import '@fontsource/noto-sans-gurmukhi/400.css'
 import './styles.css'
-
-function App() {
-  return <main aria-label="Application shell"><span>Awaaz Setu</span></main>
-}
+import App from './App'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)

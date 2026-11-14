@@ -1,5 +1,7 @@
 # Gnani M0 Smoke Test Findings
 
+> No live smoke run has been recorded yet. The sections below are a template, not verified measurements; implementation defaults currently follow the checked-in Gnani API documentation and should be treated as provisional until a human-run smoke test fills this page.
+
 Run date:
 Operator:
 Client/runtime versions:

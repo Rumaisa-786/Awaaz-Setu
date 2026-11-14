@@ -31,9 +31,13 @@ class GeminiProvider:
         self.timeout_seconds = timeout_seconds
 
     async def generate_json(self, prompt: str, schema: type[BaseModel]) -> BaseModel:
+        deadline = asyncio.get_running_loop().time() + self.timeout_seconds
         for attempt in range(self.attempts):
             try:
                 from google.genai import types
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("LLM request exceeded its time budget")
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         self.client.models.generate_content,
@@ -44,7 +48,7 @@ class GeminiProvider:
                             response_schema=schema,
                         ),
                     ),
-                    timeout=self.timeout_seconds,
+                    timeout=remaining,
                 )
                 return schema.model_validate(json.loads(response.text or ""))
             except Exception as exc:
@@ -53,7 +57,11 @@ class GeminiProvider:
                 if attempt + 1 >= self.attempts or not retryable:
                     raise
                 if not invalid_json:
-                    await asyncio.sleep(min(8.0, 0.5 * (2**attempt)) + random.uniform(0, 0.25))
+                    delay = min(8.0, 0.5 * (2**attempt)) + random.uniform(0, 0.25)
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if delay >= remaining:
+                        raise
+                    await asyncio.sleep(delay)
 
 
 def create_provider(settings: Settings | None = None) -> LLMProvider:

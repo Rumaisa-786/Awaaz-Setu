@@ -13,6 +13,7 @@ coverage/
 __pycache__/
 *.pyc
 *.egg-info/
+*.tsbuildinfo
 .venv/
 venv/
 .pytest_cache/
