@@ -18,6 +18,19 @@ TONE_TAG = {Tone.NEUTRAL: None, Tone.WARM: "<slow>", Tone.POLITE: "<pauses>", To
 TONE_REGISTER = {Tone.NEUTRAL: "neutral", Tone.WARM: "casual", Tone.POLITE: "formal", Tone.URGENT: "neutral", Tone.APOLOGETIC: "formal"}
 TONE_VOICE = {Tone.NEUTRAL: "Shivani", Tone.WARM: "Chetana", Tone.POLITE: "Tarika", Tone.URGENT: "Avinash", Tone.APOLOGETIC: "Kalpana"}
 ALL_VOICES = ("Shivani", "Lakshmi", "Kalpana", "Chetana", "Vasudha", "Riyaa", "Tarika", "Avinash", "Shubham", "Prakash", "Devansh", "Yashraj", "Harshad")
+VOICE_GENDER_IDS = {"female": "Shivani", "male": "Avinash"}
+
+
+def normalize_voice(value: str) -> str:
+    gender = value.strip().lower()
+    if gender in VOICE_GENDER_IDS:
+        return gender
+    return "male" if value in {"Avinash", "Shubham", "Prakash", "Devansh", "Yashraj", "Harshad"} else "female"
+
+
+def timbre_voice_id(value: str) -> str:
+    gender = normalize_voice(value)
+    return VOICE_GENDER_IDS[gender]
 _TAG_PATTERN = re.compile(r"<[^>]*>")
 
 

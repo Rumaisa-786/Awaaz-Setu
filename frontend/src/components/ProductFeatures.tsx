@@ -1,7 +1,7 @@
 import { House, History, Settings } from 'lucide-react'
 
-export type InputMode = 'type' | 'direct' | 'transform'
-const modes: [InputMode, string][] = [['type', 'Type / Tap'], ['direct', 'Speak-Direct'], ['transform', 'Speak & Transform']]
+export type InputMode = 'type' | 'direct'
+const modes: [InputMode, string][] = [['type', 'Type / Tap'], ['direct', 'Speak-Direct']]
 
 export function InputModeSwitcher({ value, onChange }: { value: InputMode; onChange: (value: InputMode) => void }) {
   return <div className="mode-switch" role="group" aria-label="Reply input mode">{modes.map(([mode, label]) => <button key={mode} aria-pressed={value === mode} onClick={() => onChange(mode)}>{label}</button>)}</div>

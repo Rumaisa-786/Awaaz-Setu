@@ -4,16 +4,16 @@ import { api, websocketUrl } from './lib/api'
 import { EntityCards } from './components/EntityCards'
 import { ToneSelector } from './components/ToneSelector'
 import { Transcript } from './components/Transcript'
-import { LANGUAGES, TONES, VOICES, type CallConfig, type Entity, type Tone, type TranscriptTurn } from './lib/types'
+import { LANGUAGES, type CallConfig, type Entity, type Tone, type TranscriptTurn } from './lib/types'
 import { supabase, supabaseConfigured } from './lib/supabase'
 import { InputModeSwitcher, MainNavigation, SaveSummaryToggle, SummaryDialog, type InputMode } from './components/ProductFeatures'
 type CreatedCall = { code: string; user_token: string }
 type StoredCallConfig = CallConfig & { gate_demo?: boolean }
 type RoomInfo = { code: string; state: string; goal: string; callee_connected: boolean }
 type WSEvent = Record<string, any> & { type: string }
-const defaultConfig: CallConfig = { goal: '', user_language: 'en-IN', callee_language: 'indic-auto', voice: 'Shivani', tone: 'neutral', keyterms: [], use_keyterms: true }
+const defaultConfig: CallConfig = { goal: '', user_language: 'en-IN', callee_language: 'indic-auto', voice: 'female', tone: 'neutral', keyterms: [], use_keyterms: true }
 function storedConfig(code: string): StoredCallConfig {
-  try { return JSON.parse(sessionStorage.getItem(`awaaz-config:${code}`) || 'null') || defaultConfig } catch { return defaultConfig }
+  try { const value = JSON.parse(sessionStorage.getItem(`awaaz-config:${code}`) || 'null'); return value ? { ...defaultConfig, ...value, voice: value.voice === 'male' || ['Avinash', 'Shubham', 'Prakash', 'Devansh', 'Yashraj', 'Harshad'].includes(value.voice) ? 'male' : 'female' } : defaultConfig } catch { return defaultConfig }
 }
 function routeFromPath() {
   const join = location.pathname.match(/^\/join\/([^/]+)/)
@@ -68,15 +68,30 @@ function Brand({ back }: { back?: boolean }) {
 }
 function CallSetup() {
   const [config, setConfig] = useState<CallConfig>(defaultConfig)
-  const [terms, setTerms] = useState('clinic, appointment, doctor')
-  const [expanded, setExpanded] = useState(false)
+  const [detailFields, setDetailFields] = useState(['Name', 'Date & Time', 'Location', 'Reference / Amount'])
+  const [detailValues, setDetailValues] = useState<Record<string, string>>({})
+  const [fieldsLoading, setFieldsLoading] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-  const contextTerms = useMemo(() => terms.split(/[\n,]/).map(term => term.trim()).filter(Boolean).slice(0, 20), [terms])
+  const detailPairs = Object.entries(detailValues).filter(([, value]) => value.trim())
+  const contextTerms = useMemo(() => detailPairs.map(([, value]) => value.trim().slice(0, 80)).slice(0, 20), [detailValues])
+  useEffect(() => {
+    const goal = config.goal.trim()
+    if (!goal) { setDetailFields(['Name', 'Date & Time', 'Location', 'Reference / Amount']); setFieldsLoading(false); return }
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      setFieldsLoading(true)
+      api<{ fields: string[] }>('/api/calls/context-fields', { method: 'POST', body: JSON.stringify({ goal }) })
+        .then(result => { if (!cancelled && result.fields?.length) { setDetailFields(result.fields); setDetailValues(current => Object.fromEntries(result.fields.map(field => [field, current[field] || '']))) } })
+        .catch(() => undefined).finally(() => { if (!cancelled) setFieldsLoading(false) })
+    }, 500)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [config.goal])
   async function create(event: FormEvent) {
     event.preventDefault(); setError(''); setBusy(true)
     try {
-      const result = await api<CreatedCall>('/api/calls', { method: 'POST', body: JSON.stringify({ ...config, keyterms: contextTerms }) })
+      const structuredGoal = (detailPairs.length ? `${config.goal.trim()}\nDetails: ${detailPairs.map(([label, value]) => `${label}: ${value}`).join('; ')}` : config.goal.trim()).slice(0, 500)
+      const result = await api<CreatedCall>('/api/calls', { method: 'POST', body: JSON.stringify({ ...config, goal: structuredGoal, keyterms: contextTerms }) })
       sessionStorage.setItem(`awaaz-token:${result.code}`, result.user_token)
       sessionStorage.setItem(`awaaz-config:${result.code}`, JSON.stringify({ ...config, keyterms: contextTerms }))
       history.pushState({}, '', `/call/${result.code}`)
@@ -101,22 +116,22 @@ function CallSetup() {
       <form onSubmit={create}>
         <label className="field-label" htmlFor="goal">What is this call about?</label>
         <input id="goal" className="input" value={config.goal} onChange={event => setConfig({ ...config, goal: event.target.value })} placeholder="For example, book a clinic appointment" maxLength={500}/>
-        <div className="field-grid">
-          <label>User language<select className="input" value={config.user_language} onChange={event => setConfig({ ...config, user_language: event.target.value })}>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
-          <label>Caller language hint<select className="input" value={config.callee_language} onChange={event => setConfig({ ...config, callee_language: event.target.value })}><option value="indic-auto">Automatic detection</option>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
-          <label>Voice<select className="input" value={config.voice} onChange={event => setConfig({ ...config, voice: event.target.value })}>{VOICES.map(voice => <option key={voice}>{voice}</option>)}</select></label>
-          <label>Default tone<select className="input" value={config.tone} onChange={event => setConfig({ ...config, tone: event.target.value as Tone })}>{TONES.map(tone => <option key={tone.value} value={tone.value}>{tone.label}</option>)}</select></label>
+        <div className="setup-preferences">
+          <label className="setup-language">User language<select className="input" value={config.user_language} onChange={event => setConfig({ ...config, user_language: event.target.value })}>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
+          <fieldset className="setup-voice"><legend>Voice</legend><div className="voice-segment"><button type="button" className={config.voice === 'female' ? 'selected' : ''} aria-pressed={config.voice === 'female'} onClick={() => setConfig({ ...config, voice: 'female' })}>Female</button><button type="button" className={config.voice === 'male' ? 'selected' : ''} aria-pressed={config.voice === 'male'} onClick={() => setConfig({ ...config, voice: 'male' })}>Male</button></div></fieldset>
         </div>
-        <div className="context-panel">
-          <button type="button" className="context-expand" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><span><strong>Context card</strong><small>Optional terms for names, places, or services</small></span><span aria-hidden="true">{expanded ? '−' : '+'}</span></button>
-          {expanded && <div className="context-body"><label htmlFor="terms">Keyterms (up to 20)</label><textarea id="terms" className="input textarea" value={terms} onChange={event => setTerms(event.target.value)} placeholder="Clinic, doctor's name, medicine"/><p>Terms are sent to Prisma only while keyterms are enabled. You can turn them off during the call to compare recognition.</p></div>}
-          <label className="toggle-row"><span><strong>Use context keyterms</strong><small>Switch off to compare captions without hints</small></span><input type="checkbox" checked={config.use_keyterms} onChange={event => setConfig({ ...config, use_keyterms: event.target.checked })}/><span className="switch" aria-hidden="true"/></label>
-        </div>
+        <p className="auto-detect-note"><span className="status-dot online"/>Caller language is detected automatically</p>
+        <div className="setup-tone"><strong>Default tone</strong><ToneSelector value={config.tone} onChange={tone => setConfig({ ...config, tone })}/></div>
+        <section className="context-panel details-panel" aria-label="Details card">
+          <div className="details-heading"><span><strong>DETAILS CARD</strong><small className="ai-label">AI Tailored</small></span><span className="fields-count">{detailFields.length} fields</span></div>
+          <p className="details-caption">{fieldsLoading ? 'Finding useful details…' : 'Fields generated from your call purpose'}</p>
+          <div className="context-body details-grid">{detailFields.map(field => <label key={field}>{field}<input className="input" value={detailValues[field] || ''} onChange={event => setDetailValues(current => ({ ...current, [field]: event.target.value }))} placeholder={field}/></label>)}</div>
+          <label className="details-keyterms"><input type="checkbox" checked={config.use_keyterms} onChange={event => setConfig({ ...config, use_keyterms: event.target.checked })}/><span><strong>Use context keyterms</strong><small>Boost speech recognition accuracy with these details</small></span></label>
+        </section>
         <button className="button primary full create-button" disabled={busy}>{busy ? 'Creating call…' : <><Phone size={18}/>Create call</>}</button>
       </form>
-      <p className="privacy-note"><ShieldCheck size={16}/>Assistive relay. Calls are not recorded by this prototype.</p>
-      <section className="gate-launch-card setup-gate"><span className="demo-badge">Scripted demo</span><h2>Gate Mode (Scripted Demo)</h2><p>Scripted Demo Scenario — Simulated Delivery Caller</p><button className="button secondary" type="button" onClick={() => void startGateDemo()} disabled={busy}>Start delivery demo</button></section>
     </section>
+      <p className="privacy-note"><ShieldCheck size={16}/>Assistive relay. Calls are not recorded by this prototype.</p>
   </main>
 }
 function UserCall({ code }: { code: string }) {
@@ -134,6 +149,7 @@ function UserCall({ code }: { code: string }) {
   const [text, setText] = useState('')
   const [tone, setTone] = useState<Tone>(initial.tone)
   const [voice, setVoice] = useState(initial.voice)
+  const [detectedLanguage, setDetectedLanguage] = useState('')
   const [useKeyterms, setUseKeyterms] = useState(initial.use_keyterms)
   const [keyterms] = useState<string[]>(initial.keyterms)
   const [status, setStatus] = useState('Connecting')
@@ -145,8 +161,6 @@ function UserCall({ code }: { code: string }) {
   const [micOn, setMicOn] = useState(false)
   const [micLevel, setMicLevel] = useState(0)
   const [userPartial, setUserPartial] = useState('')
-  const [transformText, setTransformText] = useState('')
-  const [autoSend, setAutoSend] = useState(false)
   const [saveAfterCall, setSaveAfterCall] = useState(false)
   const [summary, setSummary] = useState<any>(null)
   const [reconnecting, setReconnecting] = useState(false)
@@ -164,7 +178,7 @@ function UserCall({ code }: { code: string }) {
   const ttsStartedAt = useRef<number|null>(null)
   const ending = useRef(false)
   const gateDemo = Boolean(initial.gate_demo)
-  const detected = turns.slice().reverse().find(turn => turn.role === 'caller' && turn.language)?.language || initial.callee_language
+  const detected = detectedLanguage || turns.slice().reverse().find(turn => turn.role === 'caller' && turn.language)?.language || ''
   useEffect(() => {
     let stopped = false
     let retryTimer = 0
@@ -188,7 +202,7 @@ function UserCall({ code }: { code: string }) {
         try { data = JSON.parse(event.data) as WSEvent } catch { return }
         switch (data.type) {
           case 'connected': setConnected(true); setCalleeConnected(Boolean(data.gate_demo)); setStatus(data.mock_mode ? 'Mock mode' : 'Connected'); break
-          case 'transcript_history': setTurns((data.turns || []).map((turn: any) => ({ role: turn.role === 'caller' ? 'caller' : 'user', text: turn.text, translated_text: turn.translated_text }))); break
+          case 'transcript_history': setTurns((data.turns || []).map((turn: any) => ({ role: turn.role === 'caller' ? 'caller' : 'user', text: turn.text, translated_text: turn.translated_text, language: turn.language, voice: turn.voice }))); break
           case 'callee_status': setCalleeConnected(data.state === 'connected'); break
           case 'demo_banner': setDemoTitle(data.title); break
           case 'demo_disclosure': setDemoDisclosure(data.text); break
@@ -199,9 +213,9 @@ function UserCall({ code }: { code: string }) {
           case 'speech_end': setStatus('Your turn'); break
           case 'final_transcript':
             if (data.latency != null) setSttLatency(data.latency)
+            if (data.detected_language_code) setDetectedLanguage(current => current || data.detected_language_code)
             setTurns(current => [...current, { role: 'caller', text: data.text, translated_text: data.translated_text, language: data.detected_language_code, latency: data.latency }]); setStable(''); setVolatile(''); setStatus('Your turn'); break
           case 'caption_translation': setTurns(current => current.map((turn, index) => index === data.turn_index ? { ...turn, translated_text: data.text } : turn)); break
-          case 'user_reply': setTurns(current => [...current, { role: 'user', text: data.text, translated_text: data.spoken_text, language: data.language }]); break
           case 'entities': case 'entity_confirmation':
             setEntities(current => { const incoming = (data.entities || data.confirmed_entities || []).map((entity: any) => typeof entity === 'string' ? { type: 'detail', value: entity } : entity); const all = new Map(current.concat(incoming).map(entity => [`${entity.type}:${entity.value}`, entity])); return [...all.values()] }); setRisk(current => current || Boolean(data.otp_pin_cvv_request)); break
           case 'suggestions': setSuggestions(data.replies || []); break
@@ -214,8 +228,9 @@ function UserCall({ code }: { code: string }) {
           case 'error': setError(data.message); break
           case 'tone_preview': setPreview(data.text || ''); break
           case 'user_partial': setUserPartial(data.text || ''); break
-          case 'user_final': setTransformText(data.text || ''); setUserPartial(''); break
-          case 'transform_spoken': setTurns(current => [...current, { role: 'user', text: data.text, translated_text: data.spoken_text }]); break
+          case 'user_final': setUserPartial(''); break
+          case 'transform_spoken': setTurns(current => [...current, { role: 'user', text: data.text, translated_text: data.spoken_text, language: data.language, voice: data.voice }]); break
+          case 'user_reply': setTurns(current => [...current, { role: 'user', text: data.text, translated_text: data.spoken_text, language: data.language, voice: data.voice }]); break
           case 'call_ended': finalEnd = true; ending.current = true; setStatus('Call ended'); setReconnecting(false); ws.close(); break
         }
       }
@@ -273,8 +288,6 @@ function UserCall({ code }: { code: string }) {
   }
   function stopMic() { micProcessor.current?.disconnect(); micProcessor.current = null; micStream.current?.getTracks().forEach(track => track.stop()); micStream.current = null; void micContext.current?.close(); micContext.current = null; setMicOn(false); setMicLevel(0); setUserPartial('') }
   function toggleMute() { const next = !micOn; setMicOn(next); micStream.current?.getAudioTracks().forEach(track => track.enabled = next) }
-  function chooseLanguage(language: string) { socket.current?.send(JSON.stringify({ type: 'language_override', language })) }
-  function speakReviewed() { if (transformText.trim()) { socket.current?.send(JSON.stringify({ type: 'send_transform', text: transformText })); setTransformText('') } }
   async function previewTone() {
     if (socket.current?.readyState === WebSocket.OPEN && text.trim()) { socket.current.send(JSON.stringify({ type: 'preview_tone', text, tone })); setPreview('Tone preview requested…') }
   }
@@ -283,7 +296,7 @@ function UserCall({ code }: { code: string }) {
   return <main className="call-page"><Brand back/>{demoTitle && <section className="demo-call-banner"><span className="demo-badge">Scripted Demo</span><strong>{demoTitle}</strong><p>Ramesh — Blinkit / Courier at Main Gate</p></section>}{reconnecting && <div className="reconnect-banner" role="status" aria-live="polite">Reconnecting… Your captions and replies will resume when the connection returns.</div>}{elapsed >= 810 && elapsed < 900 && <div className="reconnect-banner" role="alert">This call is approaching the Prisma 15-minute stream limit. The audio stream will reconnect automatically.</div>}<header className="call-header">
     <div><span className={`status-dot ${connected ? 'online' : ''}`}/><span>{calleeConnected ? 'Caller joined' : status}</span><span className="timer">{Math.floor(elapsed / 60).toString().padStart(2, '0')}:{(elapsed % 60).toString().padStart(2, '0')}</span></div>
     <label className="compact-toggle"><span>Context keyterms</span><input aria-label="Use context keyterms" type="checkbox" checked={useKeyterms} onChange={event => setUseKeyterms(event.target.checked)}/></label>
-    <div className="language-pill"><span>Caller: {LANGUAGES.find(item => item[0] === detected)?.[1] || (detected === 'indic-auto' ? 'Detecting…' : detected)} ({detected}) → You: {LANGUAGES.find(item => item[0] === initial.user_language)?.[1]} ({initial.user_language})</span><select aria-label="Correct caller language" value={LANGUAGES.some(item => item[0] === detected) ? detected : 'indic-auto'} onChange={event => chooseLanguage(event.target.value)}><option value="indic-auto">Auto detect</option>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></div>
+    <div className="language-pill"><span>Caller: {detected ? `${LANGUAGES.find(item => item[0] === detected)?.[1] || detected} (${detected})` : 'Detecting...'} → You: {LANGUAGES.find(item => item[0] === initial.user_language)?.[1]} ({initial.user_language})</span></div>
     <div className="call-actions"><button className="button secondary copy-call" onClick={copyJoinLink}><Clipboard size={17}/>{linkCopied ? 'Copied' : 'Join link'}</button><button className="button danger" onClick={endCall}><PhoneOff size={17}/>End call</button></div>
   </header>
   {error && <div className="inline-error" role="alert"><AlertTriangle size={17}/>{error}</div>}
@@ -296,12 +309,11 @@ function UserCall({ code }: { code: string }) {
   </section>
   <section className="composer-card">
     <InputModeSwitcher value={mode} onChange={value => void setInputMode(value)}/>
-    {mode !== 'type' && <div className="mic-mode-panel"><div><strong>{mode === 'direct' ? 'Your live voice is being heard by caller' : 'Speak your reply'}</strong>{mode === 'transform' && <p>{userPartial || 'Live transcript preview will appear here.'}</p>}<div className="mic-meter" aria-label="Microphone level"><span style={{ width: `${Math.round(micLevel * 100)}%` }}/></div></div><button className="button secondary" onClick={toggleMute}>{micOn ? <MicOff size={18}/> : <Mic size={18}/>} {micOn ? 'Mute' : 'Unmute'}</button></div>}
-    {mode === 'transform' && <div className="transform-review"><label className="toggle-row"><span><strong>Auto-send on pause</strong><small>Otherwise review before speaking</small></span><input type="checkbox" checked={autoSend} onChange={event => { const enabled = event.target.checked; setAutoSend(enabled); socket.current?.send(JSON.stringify({ type:'transform_settings', behavior: enabled ? 'auto' : 'review' })) }}/></label>{transformText && <><p>You said: {transformText}</p><button className="button primary" onClick={speakReviewed}>Translate &amp; speak</button></>}</div>}
+    {mode === 'direct' && <div className="mic-mode-panel"><div><strong>Speak in {LANGUAGES.find(item => item[0] === initial.user_language)?.[1]}; your reply is translated and spoken to the caller</strong><p>{userPartial || 'Your speech will be transcribed and translated automatically.'}</p><div className="mic-meter" aria-label="Microphone level"><span style={{ width: `${Math.round(micLevel * 100)}%` }}/></div></div><button className="button secondary" onClick={toggleMute}>{micOn ? <MicOff size={18}/> : <Mic size={18}/>} {micOn ? 'Mute' : 'Unmute'}</button></div>}
     {mode === 'type' && <>
     <div className="composer-top"><strong>Suggested replies</strong><span>{suggestions.length ? 'In your language' : 'Suggestions appear after the caller speaks'}</span></div>
     {suggestions.length > 0 && <div className="suggestions">{suggestions.slice(0, 3).map((reply, index) => <button key={`${reply}-${index}`} onClick={() => sendReply(reply)}>{reply}</button>)}</div>}
-    <div className="composer-tone"><ToneSelector value={tone} onChange={setTone} compact/><label className="voice-select">Voice<select value={voice} onChange={event => setVoice(event.target.value)}>{VOICES.map(item => <option key={item}>{item}</option>)}</select></label></div>
+    <div className="composer-tone"><ToneSelector value={tone} onChange={setTone} compact/><label className="voice-select">Speaking voice<select value={voice} onChange={event => setVoice(event.target.value)}><option value="female">Female</option><option value="male">Male</option></select></label></div>
     <form className="reply-form" onSubmit={event => { event.preventDefault(); sendReply(text) }}><input aria-label="Type your reply" className="input" value={text} maxLength={1000} onChange={event => { setText(event.target.value); if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: 'typing' })) }} placeholder="Type a reply for the caller"/><button type="button" className="button secondary preview-button" onClick={previewTone} disabled={!text.trim()}>Preview tone</button><button className="button primary" disabled={!text.trim() || !connected}><Send size={17}/>Send</button></form>
     {preview && <p className="preview-text" aria-live="polite">{preview}</p>}
     <div className="composer-status"><span className={`status-dot ${connected ? 'online' : ''}`}/>{status}</div>

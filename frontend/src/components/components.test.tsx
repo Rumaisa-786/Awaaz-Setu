@@ -42,9 +42,11 @@ describe('call interface components', () => {
     expect(host.querySelector('.volatile')?.textContent).toBe(' காலை')
   })
 
-  it('switches among the three mid-call input modes', () => {
+  it('switches between Type / Tap and Speak-Direct', () => {
     const onChange = vi.fn(); render(createElement(InputModeSwitcher, { value: 'type', onChange }))
-    expect(host.querySelectorAll('[aria-pressed="false"]')).toHaveLength(2)
+    expect(host.querySelectorAll('button')).toHaveLength(2)
+    expect(host.textContent).not.toContain('Speak & Transform')
+    expect(host.querySelectorAll('[aria-pressed="false"]')).toHaveLength(1)
     act(() => Array.from(host.querySelectorAll('button')).find(button => button.textContent === 'Speak-Direct')!.click())
     expect(onChange).toHaveBeenCalledWith('direct')
   })

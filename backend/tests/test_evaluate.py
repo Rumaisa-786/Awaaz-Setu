@@ -2,9 +2,11 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from scripts import evaluate
 from scripts.evaluate import _degrade_to_8k, _metric_rows, _mock_carrier_audio, _wav_bytes, wer_cer
-from app.gnani.tts import _strip_repeated_wav_header
+from app.gnani.tts import TTSService, _TTSStreamError, _strip_repeated_wav_header
 
 
 def test_wer_cer_exact_and_error_rates():
@@ -67,3 +69,43 @@ def test_prisma_vad_silence_and_final_after_speech_end(monkeypatch):
     assert captured["headers"]["x-keyterms"] == '["\\u0921\\u0949\\u0915\\u094d\\u091f\\u0930"]'
     assert len(sent) == 17
     assert all(len(frame) == 1024 for frame in sent)
+
+
+def test_tts_tries_streaming_sse_before_websocket(monkeypatch):
+    calls = []
+    class Manager:
+        settings = SimpleNamespace(mock_mode=False, gnani_api_key=SimpleNamespace(get_secret_value=lambda: "test"))
+        async def reserve_tts(self, room, count): pass
+    class Transport:
+        async def send_event(self, payload): pass
+        async def send_audio(self, payload): pass
+    service = TTSService(Manager(), Manager.settings)
+    async def sse(key, payload, transport):
+        calls.append(("sse", payload["audio_config"]))
+    async def websocket(key, payload, transport):
+        calls.append(("websocket", payload["audio_config"]))
+    monkeypatch.setattr(service, "_sse", sse)
+    monkeypatch.setattr(service, "_websocket", websocket)
+    room = SimpleNamespace()
+    asyncio.run(service.speak(room, Transport(), "Hello", "female", "hi-IN", "neutral"))
+    assert calls == [("sse", {"sample_rate": 24000, "encoding": "linear_pcm", "container": "wav"})]
+
+
+def test_tts_does_not_restart_websocket_after_partial_sse_audio(monkeypatch):
+    calls = []
+    class Manager:
+        settings = SimpleNamespace(mock_mode=False, gnani_api_key=SimpleNamespace(get_secret_value=lambda: "test"))
+        async def reserve_tts(self, room, count): pass
+    class Transport:
+        async def send_event(self, payload): pass
+        async def send_audio(self, payload): pass
+    service = TTSService(Manager(), Manager.settings)
+    async def partial_sse(key, payload, transport):
+        calls.append("sse")
+        raise _TTSStreamError("interrupted", audio_started=True)
+    async def websocket(key, payload, transport): calls.append("websocket")
+    monkeypatch.setattr(service, "_sse", partial_sse)
+    monkeypatch.setattr(service, "_websocket", websocket)
+    with pytest.raises(_TTSStreamError):
+        asyncio.run(service.speak(SimpleNamespace(), Transport(), "Hello", "male", "hi-IN", "neutral"))
+    assert calls == ["sse"]

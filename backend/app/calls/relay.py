@@ -223,12 +223,12 @@ async def run_user_transform(room: CallSession, manager: CallSessionManager) -> 
     """Dedicated user-side STT path. It never shares the callee audio queue."""
     settings = manager.settings
     while room.state != "ended":
-        if room.input_mode != "transform":
+        if room.input_mode != "direct":
             room.user_mode_changed.clear()
             await room.user_mode_changed.wait()
             continue
         room.user_mode_changed.clear()
-        if room.input_mode != "transform":
+        if room.input_mode != "direct":
             continue
         if settings.mock_mode:
             await room.transform_gate.wait()
@@ -238,7 +238,7 @@ async def run_user_transform(room: CallSession, manager: CallSessionManager) -> 
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
-            if changed_task in done or room.input_mode != "transform":
+            if changed_task in done or room.input_mode != "direct":
                 continue
             frame = frame_task.result()
             sample = "Please call me tomorrow morning."
@@ -250,22 +250,24 @@ async def run_user_transform(room: CallSession, manager: CallSessionManager) -> 
             await room.user_mode_changed.wait()
             continue
         endpoint = settings.gnani_base_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/stt/v3/stream"
-        headers = {"x-api-key-id": settings.gnani_api_key.get_secret_value(), "x-sample-rate": "16000", "language_code": room.user_language, "language_code": room.user_language, "x-format": "transcribe", "x-model": "prisma-v3.0", "x-partials": "true"}
+        headers = {"x-api-key-id": settings.gnani_api_key.get_secret_value(), "x-sample-rate": "16000", "language_code": room.user_language, "x-format": "transcribe", "x-model": "prisma-v3.0", "x-partials": "true"}
+        if room.use_keyterms and room.keyterms:
+            headers["x-keyterms"] = json.dumps(room.keyterms[:20], ensure_ascii=True)
         try:
             async with websockets.connect(endpoint, additional_headers=headers, open_timeout=8, close_timeout=2) as upstream:
                 async def send_user_audio():
                     sent_audio = False
                     silence_sent = False
-                    while room.state != "ended" and room.input_mode == "transform":
+                    while room.state != "ended" and room.input_mode == "direct":
                         await room.transform_gate.wait()
-                        if room.input_mode != "transform":
+                        if room.input_mode != "direct":
                             return
                         try:
                             frame = await asyncio.wait_for(room.user_audio_queue.get(), timeout=0.032)
                         except asyncio.TimeoutError:
                             if sent_audio and not silence_sent:
                                 for _ in range(16):
-                                    if room.state == "ended" or room.input_mode != "transform":
+                                    if room.state == "ended" or room.input_mode != "direct":
                                         return
                                     if not room.transform_gate.is_set():
                                         break
@@ -300,7 +302,7 @@ async def run_user_transform(room: CallSession, manager: CallSessionManager) -> 
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
-                if change not in done and room.input_mode == "transform" and room.state != "ended":
+                if change not in done and room.input_mode == "direct" and room.state != "ended":
                     raise ConnectionError("User STT stream closed")
         except asyncio.CancelledError:
             raise
@@ -312,9 +314,6 @@ async def run_user_transform(room: CallSession, manager: CallSessionManager) -> 
 async def _transform_user_final(room: CallSession, text: str) -> None:
     if not text.strip():
         return
-    await _send_user(room, {"type": "user_final", "text": text})
-    if room.transform_review:
-        return
     await _speak_transformed(room, text)
 
 
@@ -324,10 +323,10 @@ async def _speak_transformed(room: CallSession, text: str) -> None:
     from app.calls.session import manager
     from app.calls.tones import Tone
     from app.llm.tasks import relay_reply
-    language = room.detected_language or room.callee_language
+    language = room.detected_language or (room.callee_language if room.callee_language != "indic-auto" else room.user_language)
     result = await relay_reply(text, room.user_language, language, room.tone)
-    room.turns.append({"role": "user", "text": text, "translated_text": result.rewritten_text})
-    await _send_user(room, {"type": "transform_spoken", "text": text, "spoken_text": result.rewritten_text})
+    room.turns.append({"role": "user", "text": text, "translated_text": result.rewritten_text, "voice": room.voice})
+    await _send_user(room, {"type": "transform_spoken", "text": text, "spoken_text": result.rewritten_text, "language": language, "voice": room.voice})
     if not room.callee_socket:
         return
     transport = WebLinkTransport(room.callee_socket, on_first_audio=lambda: _send_user(room, {"type": "tts_status", "state": "speaking"}))

@@ -10,13 +10,14 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.calls.relay import run_prisma_relay, run_user_transform, speak_reviewed_transform
 from app.calls.session import CallLimitExceeded, CallSession, manager
-from app.calls.tones import ALL_VOICES, Tone
+from app.calls.tones import ALL_VOICES, Tone, normalize_voice
 from app.calls.transport import WebLinkTransport
 from app.auth import resolve_user
 from app.config import get_settings
 from app.gnani.audio import FRAME_BYTES
 from app.gnani.tts import TTSService
 from app.llm.tasks import relay_reply, summarize_call
+from app.llm.provider import create_provider
 from app.entities import analyze_utterance
 
 router = APIRouter()
@@ -27,7 +28,7 @@ class CreateCallRequest(BaseModel):
     goal: str = Field(default="", max_length=500)
     user_language: str = "en-IN"
     callee_language: str = "indic-auto"
-    voice: str = "Shivani"
+    voice: str = "female"
     tone: Tone = Tone.NEUTRAL
     keyterms: list[str] = Field(default_factory=list, max_length=20)
     use_keyterms: bool = True
@@ -46,6 +47,13 @@ class CreateCallRequest(BaseModel):
             raise ValueError("Unsupported caller language hint")
         return value
 
+    @field_validator("voice")
+    @classmethod
+    def supported_voice(cls, value: str) -> str:
+        if value.lower() in {"female", "male"} or value in ALL_VOICES:
+            return normalize_voice(value)
+        raise ValueError("Voice must be Female or Male")
+
 
 class EndCallRequest(BaseModel):
     user_token: str
@@ -54,7 +62,7 @@ class EndCallRequest(BaseModel):
 
 class GateDemoRequest(BaseModel):
     user_language: str = "en-IN"
-    voice: str = "Shivani"
+    voice: str = "female"
 
     @field_validator("user_language")
     @classmethod
@@ -63,6 +71,52 @@ class GateDemoRequest(BaseModel):
             raise ValueError("Unsupported user language")
         return value
 
+    @field_validator("voice")
+    @classmethod
+    def supported_voice(cls, value: str) -> str:
+        if value.lower() in {"female", "male"} or value in ALL_VOICES:
+            return normalize_voice(value)
+        raise ValueError("Voice must be Female or Male")
+
+
+class ContextFieldsRequest(BaseModel):
+    goal: str = Field(default="", max_length=500)
+
+
+class ContextFieldsResponse(BaseModel):
+    fields: list[str] = Field(min_length=3, max_length=5)
+
+
+def _fallback_context_fields(goal: str) -> list[str]:
+    value = goal.casefold()
+    if any(word in value for word in ("clinic", "doctor", "appointment", "hospital", "दवा", "डॉक्टर", "अपॉइंटमेंट")):
+        return ["Patient Name", "Age", "Preferred Date & Time", "Doctor / Department"]
+    if any(word in value for word in ("delivery", "parcel", "courier", "order", "डिलीवरी", "पार्सल")):
+        return ["Recipient Name", "Flat / Gate No.", "Order / Amount", "Preferred Delivery Time"]
+    if any(word in value for word in ("bank", "payment", "bill", "amount", "बैंक", "भुगतान")):
+        return ["Account Holder Name", "Reference / Account Ending", "Amount", "Due Date"]
+    if not goal.strip():
+        return ["Name", "Date & Time", "Location", "Reference / Amount"]
+    return ["Name", "Date & Time", "Location", "Reference / Amount"]
+
+
+@router.post("/api/calls/context-fields", response_model=ContextFieldsResponse)
+async def context_fields(payload: ContextFieldsRequest) -> ContextFieldsResponse:
+    goal = payload.goal.strip()
+    if not goal or get_settings().mock_mode:
+        return ContextFieldsResponse(fields=_fallback_context_fields(goal))
+    try:
+        result = await asyncio.wait_for(
+            create_provider().generate_json(
+                "Suggest 3 to 5 short, specific form field labels for gathering only the information needed for this phone call goal. Return strict JSON with fields as an array of strings. Do not request passwords, OTPs, PINs, CVVs, or unnecessary personal data. Goal: " + goal,
+                ContextFieldsResponse,
+            ), timeout=4.0,
+        )
+        labels = list(dict.fromkeys(" ".join(str(label).split())[:50] for label in result.fields if str(label).strip()))[:5]
+        return ContextFieldsResponse(fields=labels if len(labels) >= 3 else _fallback_context_fields(goal))
+    except Exception:
+        return ContextFieldsResponse(fields=_fallback_context_fields(goal))
+
 
 def _public_room(room: CallSession) -> dict[str, Any]:
     return {"code": room.code, "state": room.state, "goal": room.goal, "created_at": room.created_iso, "callee_connected": room.callee_socket is not None, "gate_demo": room.gate_demo}
@@ -70,8 +124,6 @@ def _public_room(room: CallSession) -> dict[str, Any]:
 
 @router.post("/api/calls", status_code=201)
 async def create_call(payload: CreateCallRequest, request: Request) -> dict[str, object]:
-    if payload.voice not in ALL_VOICES:
-        raise HTTPException(422, "Unsupported Timbre v3.0 voice")
     if any("<|" in term or "|>" in term for term in payload.keyterms):
         raise HTTPException(422, "Keyterms contain an invalid marker")
     try:
@@ -93,8 +145,6 @@ async def create_call(payload: CreateCallRequest, request: Request) -> dict[str,
 
 @router.post("/api/demo/gate", status_code=201)
 async def create_gate_demo(payload: GateDemoRequest, request: Request) -> dict[str, object]:
-    if payload.voice not in ALL_VOICES:
-        raise HTTPException(422, "Unsupported Timbre v3.0 voice")
     try:
         room = await manager.create(owner_id=await resolve_user(request), goal="Scripted demo: simulated delivery at the main gate", user_language=payload.user_language, callee_language="hi-IN", voice=payload.voice, tone=Tone.POLITE, keyterms=["Blinkit", "Ramesh", "₹450", "main gate"], use_keyterms=True)
     except CallLimitExceeded as exc:
@@ -243,10 +293,7 @@ async def user_channel(websocket: WebSocket, code: str) -> None:
                 data = packet["bytes"]
                 if len(data) != FRAME_BYTES:
                     await _send_room(room, {"type": "error", "message": "Audio frames must contain exactly 1,024 bytes."})
-                elif room.input_mode == "direct":
-                    if room.callee_socket:
-                        await room.callee_socket.send_bytes(data)
-                elif room.input_mode == "transform" and room.transform_gate.is_set():
+                elif room.input_mode == "direct" and room.transform_gate.is_set():
                     try:
                         room.user_audio_queue.put_nowait(data)
                     except asyncio.QueueFull:
@@ -287,12 +334,12 @@ async def _handle_user_message(room: CallSession, message: dict[str, Any]) -> No
             await _send_room(room, {"type": "error", "message": "Choose one of the available tones."})
             return
         voice = message.get("voice")
-        if voice in ALL_VOICES:
-            room.voice = voice
+        if isinstance(voice, str) and (voice.lower() in {"female", "male"} or voice in ALL_VOICES):
+            room.voice = normalize_voice(voice)
         return
     if kind == "input_mode":
         mode = message.get("mode")
-        if mode not in {"type", "direct", "transform"}:
+        if mode not in {"type", "direct"}:
             await _send_room(room, {"type": "error", "message": "Choose one of the available input modes."})
             return
         if room.input_mode != mode:
@@ -334,14 +381,18 @@ async def _handle_user_message(room: CallSession, message: dict[str, Any]) -> No
     except ValueError:
         tone = room.tone
     source_language = str(message.get("language", room.user_language))
-    rewrite = await relay_reply(text, source_language, room.detected_language or room.callee_language, tone)
+    requested_voice = message.get("voice")
+    if isinstance(requested_voice, str) and (requested_voice.lower() in {"female", "male"} or requested_voice in ALL_VOICES):
+        room.voice = normalize_voice(requested_voice)
+    spoken_language = room.detected_language or (room.callee_language if room.callee_language != "indic-auto" else room.user_language)
+    rewrite = await relay_reply(text, source_language, spoken_language, tone)
     if rewrite.uncertainty:
         await _send_room(room, {"type": "service_status", "service": "llm", "state": "fallback"})
     if kind == "preview_tone":
         await _send_room(room, {"type": "tone_preview", "text": rewrite.rewritten_text, "tone": tone.value})
         return
-    room.turns.append({"role": "user", "text": text, "translated_text": rewrite.rewritten_text})
-    await _send_room(room, {"type": "user_reply", "text": text, "spoken_text": rewrite.rewritten_text, "language": room.detected_language or room.callee_language})
+    room.turns.append({"role": "user", "text": text, "translated_text": rewrite.rewritten_text, "language": spoken_language, "voice": room.voice})
+    await _send_room(room, {"type": "user_reply", "text": text, "spoken_text": rewrite.rewritten_text, "language": spoken_language, "voice": room.voice})
     callee = room.callee_socket
     if not callee:
         await _send_room(room, {"type": "error", "message": "The other caller has not joined yet."})
@@ -354,7 +405,7 @@ async def _handle_user_message(room: CallSession, message: dict[str, Any]) -> No
         task.add_done_callback(room.tts_tasks.discard)
         return
     try:
-        await tts_service.speak(room, transport, rewrite.rewritten_text, room.voice, room.detected_language or room.callee_language, tone, rewrite.audio_tag)
+        await tts_service.speak(room, transport, rewrite.rewritten_text, room.voice, spoken_language, tone, rewrite.audio_tag)
         await transport.send_event({"type": "user_status", "state": "delivered"})
         await _send_room(room, {"type": "tts_status", "state": "delivered"})
     except Exception as exc:

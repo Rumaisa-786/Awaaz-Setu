@@ -19,7 +19,7 @@ class CallSession:
     goal: str = ""
     user_language: str = "en-IN"
     callee_language: str = "indic-auto"
-    voice: str = "Shivani"
+    voice: str = "female"
     tone: Tone = Tone.NEUTRAL
     keyterms: list[str] = field(default_factory=list)
     use_keyterms: bool = True

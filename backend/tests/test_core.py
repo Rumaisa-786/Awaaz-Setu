@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.calls.relay import build_prisma_headers
 from app.calls.session import manager as global_manager
-from app.calls.tones import Tone, TTS_TAGS, sanitize_tts_text
+from app.calls.tones import Tone, TTS_TAGS, sanitize_tts_text, timbre_voice_id
 from app.config import Settings
 from app.entities import analyze_utterance, detect_security_risk, extract_entities
 from app.gnani.audio import FRAME_BYTES
@@ -98,6 +98,11 @@ def test_timbre_tag_whitelist_strips_unverified_markup():
     assert sanitize_tts_text("Hello", Tone.NEUTRAL, "<laugh>") == "<laugh> Hello"
 
 
+def test_gender_voice_ids_map_to_supported_timbre_voices():
+    assert timbre_voice_id("female") == "Shivani"
+    assert timbre_voice_id("male") == "Avinash"
+
+
 def test_mock_two_channel_websocket_call_flow(monkeypatch):
     monkeypatch.setattr(global_manager.settings, "mock_mode", True)
     with TestClient(app) as client:
@@ -168,7 +173,7 @@ def test_summary_and_transcript_persist_only_after_explicit_opt_in(monkeypatch):
     assert saved_room.persisted_transcript == [{"role": "caller", "text": "Call back at 10"}]
 
 
-def test_speak_direct_and_transform_use_separate_user_audio_channel(monkeypatch):
+def test_speak_direct_routes_user_audio_through_translation_pipeline(monkeypatch):
     import asyncio
     monkeypatch.setattr(global_manager.settings, "mock_mode", True)
     with TestClient(app) as client:
@@ -180,18 +185,36 @@ def test_speak_direct_and_transform_use_separate_user_audio_channel(monkeypatch)
             assert callee.receive_json()["channel"] == "callee"
             user.send_json({"type": "input_mode", "mode": "direct"})
             assert user.receive_json()["type"] == "input_mode"
-            frame = bytes([4]) * FRAME_BYTES
-            user.send_bytes(frame)
-            assert callee.receive_bytes() == frame
-            assert room.audio_queue.empty()
-            user.send_json({"type": "input_mode", "mode": "transform"})
-            assert user.receive_json()["type"] == "input_mode"
             user.send_bytes(bytes(FRAME_BYTES))
-            seen = []
-            while not any(item["type"] == "user_final" for item in seen):
-                seen.append(user.receive_json())
-            assert any(item["type"] == "user_partial" for item in seen)
+            events = []
+            while not any(item["type"] == "transform_spoken" for item in events):
+                events.append(user.receive_json())
+            spoken = next(item for item in events if item["type"] == "transform_spoken")
+            assert spoken["text"] == "Please call me tomorrow morning."
+            assert spoken["voice"] == "female"
             assert room.audio_queue.empty()
+            assert client.post(f"/api/calls/{room.code}/end", json={"user_token": created["user_token"]}).status_code == 200
+
+
+def test_context_fields_endpoint_returns_goal_specific_mock_fields(monkeypatch):
+    monkeypatch.setattr(global_manager.settings, "mock_mode", True)
+    client = TestClient(app)
+    clinic = client.post("/api/calls/context-fields", json={"goal": "Book a clinic appointment"})
+    delivery = client.post("/api/calls/context-fields", json={"goal": "Arrange a delivery"})
+    assert clinic.status_code == 200
+    assert clinic.json()["fields"] == ["Patient Name", "Age", "Preferred Date & Time", "Doctor / Department"]
+    assert delivery.json()["fields"] == ["Recipient Name", "Flat / Gate No.", "Order / Amount", "Preferred Delivery Time"]
+
+
+def test_create_call_accepts_gender_and_legacy_voice_names():
+    client = TestClient(app)
+    female = client.post("/api/calls", json={"voice": "Female"})
+    male_legacy = client.post("/api/calls", json={"voice": "Avinash"})
+    assert female.status_code == male_legacy.status_code == 201
+    assert global_manager.sessions[female.json()["code"]].voice == "female"
+    assert global_manager.sessions[male_legacy.json()["code"]].voice == "male"
+    client.post(f"/api/calls/{female.json()['code']}/end", json={"user_token": female.json()["user_token"]})
+    client.post(f"/api/calls/{male_legacy.json()['code']}/end", json={"user_token": male_legacy.json()["user_token"]})
 
 
 def test_gate_demo_injects_scripted_delivery_caption_safety_and_replies(monkeypatch):
