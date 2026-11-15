@@ -21,13 +21,12 @@ def build_prisma_headers(room: CallSession, settings: Settings) -> dict[str, str
         "x-api-key-id": settings.gnani_api_key.get_secret_value(),
         "x-sample-rate": "16000",
         "language_code": room.callee_language or "indic-auto",
-        "x-language-code": room.callee_language or "indic-auto",
         "x-format": "transcribe",
         "x-model": "prisma-v3.0",
         "x-partials": "true",
     }
     if room.use_keyterms and room.keyterms:
-        headers["x-keyterms"] = json.dumps(room.keyterms[:20], ensure_ascii=False)
+        headers["x-keyterms"] = json.dumps(room.keyterms[:20], ensure_ascii=True)
     return headers
 
 
@@ -74,16 +73,22 @@ async def _translate_caption(room: CallSession, text: str, source_language: str,
 
 
 async def _enrich_final(room: CallSession, text: str, language: str, analysis: dict[str, object]) -> None:
-    try:
-        suggestions, confirmed = await asyncio.gather(
+    suggestions, confirmed = await asyncio.gather(
             suggest_replies(text, language or room.detected_language or "en-IN", room.goal, room.keyterms if room.use_keyterms else [], room.turns, reply_language=room.user_language),
             confirm_entities(text, extract_entities(text), bool(analysis["otp_pin_cvv_request"])),
+            return_exceptions=True,
         )
-        await _send_user(room, {"type": "suggestions", "replies": suggestions.replies, "needs_free_text": suggestions.needs_free_text, "language": language})
-        if confirmed.confirmed_entities or confirmed.risk_request:
+    failed = isinstance(suggestions, Exception)
+    if failed:
+        from app.llm.tasks import fallback_suggestions
+        suggestions = type("Fallback", (), {"replies": fallback_suggestions(room.user_language), "needs_free_text": True})()
+    if isinstance(confirmed, Exception):
+        confirmed = type("Fallback", (), {"confirmed_entities": analysis["entities"], "risk_request": analysis["otp_pin_cvv_request"]})()
+        failed = True
+    await _send_user(room, {"type": "suggestions", "replies": suggestions.replies, "needs_free_text": suggestions.needs_free_text, "language": room.user_language})
+    await _send_user(room, {"type": "service_status", "service": "llm", "state": "fallback" if failed else "ready"})
+    if confirmed.confirmed_entities or confirmed.risk_request:
             await _send_user(room, {"type": "entity_confirmation", "entities": confirmed.confirmed_entities, "otp_pin_cvv_request": confirmed.risk_request})
-    except Exception as exc:
-        logger.info("LLM enrichment failed (%s)", type(exc).__name__)
 
 
 async def run_prisma_relay(room: CallSession, manager: CallSessionManager, settings: Settings | None = None) -> None:
@@ -106,16 +111,19 @@ async def run_prisma_relay(room: CallSession, manager: CallSessionManager, setti
                 sender = asyncio.create_task(_send_frames(room, upstream))
                 receiver = asyncio.create_task(_receive_transcripts(room, upstream))
                 change = asyncio.create_task(room.settings_changed.wait())
-                done, pending = await asyncio.wait({sender, receiver, change}, return_when=asyncio.FIRST_COMPLETED)
-                reconnect = change in done and room.state != "ended"
+                remaining = max(1.0, min(settings.call_max_minutes, settings.session_duration_minutes_limit) * 60 - (room.age_minutes * 60) - 10)
+                rotate = asyncio.create_task(asyncio.sleep(min(14.5 * 60, remaining)))
+                done, pending = await asyncio.wait({sender, receiver, change, rotate}, return_when=asyncio.FIRST_COMPLETED)
+                reconnect = (change in done or rotate in done) and room.state != "ended"
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
                 for task in done:
-                    if task is not change:
+                    if task not in {change, rotate}:
                         task.result()
                 if reconnect:
-                    await _send_user(room, {"type": "connection_status", "service": "stt", "state": "reconnecting", "reason": "context settings changed"})
+                    reason = "context settings changed" if change in done else "proactive session rotation before provider cap"
+                    await _send_user(room, {"type": "connection_status", "service": "stt", "state": "reconnecting", "reason": reason})
                     continue
                 if room.state == "ended":
                     break
@@ -130,11 +138,25 @@ async def run_prisma_relay(room: CallSession, manager: CallSessionManager, setti
 
 
 async def _send_frames(room: CallSession, upstream: websockets.ClientConnection) -> None:
+    sent_audio = False
+    silence_sent = False
     while room.state != "ended":
-        frame = await room.audio_queue.get()
+        try:
+            frame = await asyncio.wait_for(room.audio_queue.get(), timeout=0.032)
+        except asyncio.TimeoutError:
+            if sent_audio and not silence_sent:
+                for _ in range(16):
+                    if room.state == "ended":
+                        return
+                    await upstream.send(bytes(FRAME_BYTES))
+                    await asyncio.sleep(0.032)
+                silence_sent = True
+            continue
         if len(frame) != FRAME_BYTES:
             continue
         await upstream.send(frame)
+        sent_audio = True
+        silence_sent = False
         await asyncio.sleep(0.032)
 
 
@@ -228,17 +250,35 @@ async def run_user_transform(room: CallSession, manager: CallSessionManager) -> 
             await room.user_mode_changed.wait()
             continue
         endpoint = settings.gnani_base_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/stt/v3/stream"
-        headers = {"x-api-key-id": settings.gnani_api_key.get_secret_value(), "x-sample-rate": "16000", "language_code": room.user_language, "x-language-code": room.user_language, "x-format": "transcribe", "x-model": "prisma-v3.0", "x-partials": "true"}
+        headers = {"x-api-key-id": settings.gnani_api_key.get_secret_value(), "x-sample-rate": "16000", "language_code": room.user_language, "language_code": room.user_language, "x-format": "transcribe", "x-model": "prisma-v3.0", "x-partials": "true"}
         try:
             async with websockets.connect(endpoint, additional_headers=headers, open_timeout=8, close_timeout=2) as upstream:
                 async def send_user_audio():
+                    sent_audio = False
+                    silence_sent = False
                     while room.state != "ended" and room.input_mode == "transform":
                         await room.transform_gate.wait()
                         if room.input_mode != "transform":
                             return
-                        frame = await room.user_audio_queue.get()
+                        try:
+                            frame = await asyncio.wait_for(room.user_audio_queue.get(), timeout=0.032)
+                        except asyncio.TimeoutError:
+                            if sent_audio and not silence_sent:
+                                for _ in range(16):
+                                    if room.state == "ended" or room.input_mode != "transform":
+                                        return
+                                    if not room.transform_gate.is_set():
+                                        break
+                                    await upstream.send(bytes(FRAME_BYTES))
+                                    await asyncio.sleep(0.032)
+                                if not room.transform_gate.is_set():
+                                    continue
+                                silence_sent = True
+                            continue
                         if len(frame) == FRAME_BYTES:
                             await upstream.send(frame)
+                            sent_audio = True
+                            silence_sent = False
                             await asyncio.sleep(.032)
                 async def receive_user_text():
                     async for raw in upstream:

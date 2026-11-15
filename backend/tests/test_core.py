@@ -192,3 +192,32 @@ def test_speak_direct_and_transform_use_separate_user_audio_channel(monkeypatch)
                 seen.append(user.receive_json())
             assert any(item["type"] == "user_partial" for item in seen)
             assert room.audio_queue.empty()
+
+
+def test_gate_demo_injects_scripted_delivery_caption_safety_and_replies(monkeypatch):
+    monkeypatch.setattr(global_manager.settings, "mock_mode", True)
+    with TestClient(app) as client:
+        response = client.post("/api/demo/gate", json={})
+        assert response.status_code == 201
+        created = response.json(); room = global_manager.sessions[created["code"]]
+        assert created["gate_demo"] is True
+        with client.websocket_connect(f"/ws/call/user/{created['code']}") as user:
+            user.send_json({"type": "auth", "token": created["user_token"]})
+            assert user.receive_json()["type"] == "connected"
+            events = []
+            while not any(event["type"] == "suggestions" for event in events):
+                events.append(user.receive_json())
+            banner = next(event for event in events if event["type"] == "demo_banner")
+            assert banner["caller"] == "Ramesh — Blinkit / Courier at Main Gate"
+            assert any(event.get("otp_pin_cvv_request") is True for event in events if event["type"] == "entities")
+            assert "₹450" in [entity["value"] for event in events if event["type"] == "entities" for entity in event["entities"]]
+            replies = next(event["replies"] for event in events if event["type"] == "suggestions")
+            assert replies[0] == "Please leave it with the security guard"
+            user.send_json({"type": "send_text", "text": replies[0], "language": "en-IN"})
+            while True:
+                event = user.receive_json()
+                if event["type"] == "user_reply":
+                    assert event["spoken_text"] == replies[0]
+                    break
+        ended = client.post(f"/api/calls/{room.code}/end", json={"user_token": created["user_token"]})
+        assert ended.status_code == 200

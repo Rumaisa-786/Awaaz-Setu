@@ -76,7 +76,7 @@ Give three short, natural, non-committal responses. Never agree to payment, cons
         cleaned = [" ".join(reply.split()[:12]) for reply in result.replies[:3]]
         return SuggestionResult(replies=cleaned, needs_free_text=result.needs_free_text)
     except Exception:
-        return fallback
+        raise
 
 
 async def apply_tone(text: str, tone: Tone, language_code: str) -> ToneResult:

@@ -46,6 +46,10 @@ class CallSession:
     summary: dict[str, Any] | None = None
     direct_audio: bool = False
     transform_review: bool = True
+    gate_demo: bool = False
+    gate_audio_task: asyncio.Task[None] | None = None
+    tts_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    tts_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:
         self.transform_gate.set()

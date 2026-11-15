@@ -1,5 +1,6 @@
 param(
-  [Parameter(Position=0)][ValidateSet('setup','install','test','smoke','api','frontend')][string]$Task = 'setup'
+  [Parameter(Position=0)][ValidateSet('setup','install','test','smoke','api','frontend','eval')][string]$Task = 'setup',
+  [Parameter(ValueFromRemainingArguments=$true)][string[]]$TaskArgs
 )
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -37,6 +38,7 @@ switch ($Task) {
   }
   'test' { & $VenvPython -m pytest (Join-Path $Backend 'tests'); if ($LASTEXITCODE -ne 0) { throw 'Backend tests failed.' } }
   'smoke' { & $VenvPython (Join-Path $Backend 'scripts\smoke_tests.py'); if ($LASTEXITCODE -ne 0) { throw 'Smoke suite failed.' } }
+  'eval' { & $VenvPython (Join-Path $Backend 'scripts\evaluate.py') @TaskArgs; if ($LASTEXITCODE -ne 0) { throw 'Evaluation failed.' } }
   'api' { & $VenvPython -m uvicorn app.main:app --app-dir $Backend --reload }
   'frontend' { npm --prefix (Join-Path $Root 'frontend') run dev }
 }

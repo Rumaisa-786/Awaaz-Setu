@@ -84,29 +84,34 @@ async def stt_stream(key: str, clip: Path) -> None:
         pcm_by_rate = {8000: pcm, 16000: b"".join(pcm[i:i+2] * 2 for i in range(0, len(pcm), 2))}
     else:
         pcm_by_rate = {16000: pcm, 8000: b"".join(pcm[i:i+2] for i in range(0, len(pcm), 4))}
-    probes = (("model-header", {"x-model": "prisma-v3.0"}), ("without-model-header", {}), ("keyterms", {"x-keyterms": '["clinic", "appointment"]'}), ("bias-list-score", {"x-bias-list": '["clinic", "appointment"]', "x-bias-score": "1.0"}), ("partials", {"x-partials": "true"}))
+    probes = (("model-header", {}), ("without-model-header", {"x-model": None}), ("keyterms", {"x-keyterms": json.dumps(["clinic", "appointment"], ensure_ascii=True)}), ("bias-list-score", {"x-bias-list": '["clinic", "appointment"]', "x-bias-score": "1.0"}), ("partials", {"x-partials": "true"}))
     for rate, pcm in pcm_by_rate.items():
       pace = 0.032 if rate == 16000 else 0.064
       for label, extra in probes:
-        headers = {"x-api-key-id": key, "language_code": "indic-auto", "x-sample-rate": str(rate), "x-format": "transcribe", **extra}
+        headers = {"x-api-key-id": key, "language_code": "indic-auto", "x-sample-rate": str(rate), "x-format": "transcribe", "x-model": "prisma-v3.0", **extra}
+        if headers.get("x-model") is None: del headers["x-model"]
         t0 = time.perf_counter()
         try:
             async with websockets.connect(BASE.replace("https://", "wss://") + "/stt/v3/stream", additional_headers=headers, open_timeout=15) as ws:
-                greeting = await asyncio.wait_for(ws.recv(), timeout=10)
-                print(json.dumps({"probe": label, "sample_rate": rate, "frame_bytes": 1024, "frame_pace_ms": pace * 1000, "handshake_s": round(time.perf_counter()-t0, 3), "connected": greeting if isinstance(greeting, str) else "binary"}))
+                print(json.dumps({"probe": label, "sample_rate": rate, "frame_bytes": 1024, "frame_pace_ms": pace * 1000, "handshake_s": round(time.perf_counter()-t0, 3), "connected": True}))
                 for offset in range(0, len(pcm), 1024):
                     frame = pcm[offset:offset+1024]
                     if len(frame) < 1024: frame += bytes(1024-len(frame))
                     await ws.send(frame); await asyncio.sleep(pace)
-                await asyncio.sleep(1.0)
-                try:
+                # Silence frames trigger Prisma VAD; there is no JSON commit command.
+                for _ in range(16):
+                    await ws.send(bytes(1024)); await asyncio.sleep(pace)
+                saw_speech_end = False
+                async with asyncio.timeout(15):
                     while True:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=1)
-                        print(json.dumps({"probe": label, "message": msg if isinstance(msg, str) else "binary"}))
-                except asyncio.TimeoutError:
-                    pass
+                        msg = await ws.recv()
+                        if not isinstance(msg, str): continue
+                        event = json.loads(msg)
+                        print(json.dumps({"probe": label, "message": event}))
+                        if event.get("type") == "speech_end": saw_speech_end = True
+                        if saw_speech_end and event.get("type") in {"transcript", "final_transcript"}: break
         except Exception as exc:
-            print(json.dumps({"probe": label, "sample_rate": rate, "error_type": type(exc).__name__, "detail": str(exc)[:500]}))
+            print(json.dumps({"probe": label, "sample_rate": rate, "error_type": type(exc).__name__}))
 
 
 def wav_info(payload: bytes) -> dict[str, int | str]:
@@ -166,7 +171,7 @@ def tts(key: str) -> None:
                             print(json.dumps({"mode": "websocket", "event": event.get("type"), "first_audio_latency_s": round(first_audio, 3) if first_audio else None, "audio_chunks": chunks}))
                             break
         except Exception as exc:
-            print(json.dumps({"mode": "websocket", "error_type": type(exc).__name__, "detail": str(exc)[:500]}))
+            print(json.dumps({"mode": "websocket", "error_type": type(exc).__name__}))
     asyncio.run(tts_ws_probe())
 
 

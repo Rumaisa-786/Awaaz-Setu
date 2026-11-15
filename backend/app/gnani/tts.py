@@ -16,6 +16,13 @@ from app.gnani.audio import mock_tts_wav
 logger = logging.getLogger(__name__)
 
 
+def _strip_repeated_wav_header(chunk: bytes, first_chunk: bool) -> bytes:
+    """Timbre SSE repeats a 44-byte RIFF/WAV header on chunks after the first."""
+    if not first_chunk and chunk.startswith(b"RIFF") and chunk[8:12] == b"WAVE":
+        return chunk[44:]
+    return chunk
+
+
 class TTSService:
     def __init__(self, manager: CallSessionManager, settings: Settings | None = None):
         self.manager = manager
@@ -43,7 +50,7 @@ class TTSService:
             "voice": voice,
             "model": "timbre-v3.0",
             "language": language or "auto",
-            "audio_config": {"sample_rate": 24_000, "num_channels": 1, "sample_width": 2, "encoding": "linear_pcm", "container": "wav"},
+            "audio_config": {"sample_rate": 24_000, "encoding": "linear_pcm", "container": "wav"},
         }
         ws_url = self.settings.gnani_base_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/api/v1/tts"
         audio_sent = False
@@ -76,6 +83,7 @@ class TTSService:
 
     async def _sse(self, key: str, payload: dict[str, object], transport: CalleeTransport) -> None:
         endpoint = self.settings.gnani_base_url.rstrip("/") + "/api/v1/tts/sse"
+        first_audio_chunk = True
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0)) as client:
             async with client.stream("POST", endpoint, headers={"X-API-Key-ID": key}, json=payload) as response:
                 response.raise_for_status()
@@ -88,6 +96,9 @@ class TTSService:
                     event = json.loads(content)
                     encoded = event.get("audio", "")
                     if encoded:
-                        await transport.send_audio(base64.b64decode(encoded))
+                        chunk = base64.b64decode(encoded)
+                        chunk = _strip_repeated_wav_header(chunk, first_audio_chunk)
+                        first_audio_chunk = False
+                        await transport.send_audio(chunk)
                     if event.get("is_final"):
                         return
